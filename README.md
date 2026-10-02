@@ -11,7 +11,7 @@ Specs: `WorthyWaste — PRD.md`, `WorthyWaste — Tech Spec.md`, `WorthyWaste �
 # 1. API (FastAPI + SQLite). Seeds demo data on first start.
 cd backend
 python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt        # macOS/Linux: .venv/bin/pip
+.venv/Scripts/pip install -r requirements-dev.txt    # macOS/Linux: .venv/bin/pip
 WW_SCRIPTED=1 .venv/Scripts/python -m uvicorn app.main:app --port 8000 --reload --reload-dir app
 
 # 2. Front end (Next.js + Tailwind), in another terminal
@@ -76,3 +76,13 @@ cd backend && .venv/Scripts/python -m pytest -q
 
 `tests/test_demo_flow.py` runs the whole click path against a fresh database and asserts ₹340, the duplicate-photo block,
 score 642 and the unlocked ₹5,000 loan. If you change the seed, this test tells you whether the script still holds.
+
+## Deploy
+
+- **API → Render.** New → Blueprint → pick this repo; `render.yaml` sets everything up. The free plan sleeps after
+  15 idle minutes and its disk is wiped on restart, so the API re-seeds fresh demo data on each cold start.
+  Open `/health` a minute before recording to wake it.
+- **Front end → Vercel**, root directory `frontend`, with `API_URL` set to the Render URL at build time
+  (rewrites are fixed at build): `vercel deploy --prod --cwd frontend --build-env API_URL=https://<api>.onrender.com`.
+
+`POST /api/demo/reset` is open on purpose for the demo; set `WW_ALLOW_RESET=0` on any non-demo deployment.
