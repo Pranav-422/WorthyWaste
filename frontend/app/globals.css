@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+/* Design Doc → Visual identity. Colour carries meaning once:
+   leaf = done/verified, marigold = money, brick = stop/fraud. */
+@theme {
+  --color-leaf: #1e7f4f;
+  --color-leaf-dark: #155c39;
+  --color-leaf-soft: #dcefe3;
+  --color-kraft: #efe6d2;
+  --color-kraft-deep: #e2d5b8;
+  --color-ink: #1c2b22;
+  --color-marigold: #f2a900;
+  --color-marigold-soft: #fdf0c8;
+  --color-brick: #c2410c;
+  --color-brick-soft: #fbe3d6;
+  --color-slate: #5b6b63;
+  --color-line: #d6ccb6;
+  --color-paper: #fbf8f1;
+
+  --font-display: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-noto), var(--font-noto-deva), ui-sans-serif, system-ui, sans-serif;
+}
+
+html,
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-tap-highlight-color: transparent;
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Kraft paper grain for the collector app. */
+.kraft {
+  background-color: var(--color-kraft);
+  background-image: radial-gradient(rgba(28, 43, 34, 0.045) 1px, transparent 1px);
+  background-size: 6px 6px;
+}
+
+@keyframes pop {
+  0% { transform: scale(0.85); opacity: 0; }
+  60% { transform: scale(1.04); opacity: 1; }
+  100% { transform: scale(1); }
+}
+.animate-pop {
+  animation: pop 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-pop { animation: none; }
+}
