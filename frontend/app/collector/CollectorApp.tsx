@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, get, postForm } from "@/lib/api";
+import { ApiError, get, logout, postForm } from "@/lib/api";
 import { kg, mmss, parseTs, rupees, shortDate } from "@/lib/format";
 import { t, voice, type Lang } from "@/lib/i18n";
 import { getLocation } from "@/lib/location";
@@ -52,6 +52,13 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
             <p className="text-xs text-slate">{t(lang, "homeHello")}</p>
             <p className="truncate font-display text-lg font-semibold leading-tight">{c.name}</p>
           </div>
+          <button
+            onClick={() => logout("collector")}
+            className="h-11 rounded-full px-2 text-xs text-slate underline"
+            aria-label="Log out"
+          >
+            {lang === "hi" ? "बाहर" : "Log out"}
+          </button>
           <button
             onClick={() => setLang(lang === "hi" ? "en" : "hi")}
             className="h-11 rounded-full border border-line bg-paper px-4 text-sm font-semibold"

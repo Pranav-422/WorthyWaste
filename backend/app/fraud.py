@@ -5,9 +5,8 @@ import math
 import statistics
 from datetime import timedelta
 
-import imagehash
 
-from . import clock
+from . import clock, phash
 
 DUP_PHOTO_MAX_DISTANCE = 6
 DUP_PHOTO_WINDOW_DAYS = 30
@@ -54,8 +53,7 @@ def raise_flag(conn, *, entity_type, entity_id, rule, detail, evidence=None,
 
 # ---------- Duplicate photo (at POST /requests) ----------
 
-def find_duplicate_photo(conn, phash: str) -> dict | None:
-    new = imagehash.hex_to_hash(phash)
+def find_duplicate_photo(conn, new_hash: str) -> dict | None:
     since = clock.ago(days=DUP_PHOTO_WINDOW_DAYS)
     best = None
     for r in conn.execute(
@@ -63,7 +61,7 @@ def find_duplicate_photo(conn, phash: str) -> dict | None:
         "WHERE photo_phash IS NOT NULL AND created_at >= ?",
         (since,),
     ):
-        d = new - imagehash.hex_to_hash(r["photo_phash"])
+        d = phash.distance(new_hash, r["photo_phash"])
         if d <= DUP_PHOTO_MAX_DISTANCE and (best is None or d < best["distance"]):
             best = {"request_id": r["id"], "collector_id": r["collector_id"],
                     "distance": int(d), "created_at": r["created_at"]}

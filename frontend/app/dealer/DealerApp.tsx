@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, get, post } from "@/lib/api";
+import { ApiError, get, logout, post } from "@/lib/api";
 import { kg, rupees, shortTime, timeAgo } from "@/lib/format";
 import { getLocation } from "@/lib/location";
 import type { Batch, Collector, Dealer, Material, MassBalance, SaleRequest, Transaction } from "@/lib/types";
@@ -83,6 +83,9 @@ export function DealerApp({ dealerId, demo }: { dealerId: number; demo: boolean 
               <option value="gps">📍 Real GPS</option>
             </select>
           )}
+          <button onClick={() => logout("dealer")} className="text-xs text-slate underline">
+            Log out
+          </button>
         </header>
 
         {step ? (

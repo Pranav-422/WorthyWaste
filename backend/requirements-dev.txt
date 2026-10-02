@@ -1,4 +1,5 @@
 -r requirements.txt
+uvicorn[standard]==0.54.0
 httpx==0.28.1
 pytest==9.1.1
 # voice clips (scripts/make_audio.py)

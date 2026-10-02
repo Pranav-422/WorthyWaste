@@ -47,12 +47,14 @@ class PaymentAdapter(ABC):
     @abstractmethod
     def initiate(self, payer_vpa: str, payee_vpa: str, amount: float) -> PaymentInit: ...
 
-    # Seconds after which the mock provider calls our webhook. Real providers call it themselves.
-    mock_webhook_delay: float | None = None
+    # Mock only: a pending payment older than this many seconds is settled as successful the next
+    # time anyone checks on it. No background timer, so it works on serverless too. Real providers
+    # call POST /api/payments/webhook themselves and leave this as None.
+    settles_after_s: float | None = None
 
 
 class MockUpi(PaymentAdapter):
-    mock_webhook_delay = 1.0
+    settles_after_s = 1.0
 
     def initiate(self, payer_vpa: str, payee_vpa: str, amount: float) -> PaymentInit:
         return PaymentInit(provider_ref=new_upi_ref(), status="pending")

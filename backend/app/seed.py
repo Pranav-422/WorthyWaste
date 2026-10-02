@@ -14,8 +14,11 @@ import hashlib
 import random
 from datetime import datetime, timedelta
 
-from . import adapters, clock, fraud, score, services
-from .db import init_db, transaction
+from . import adapters, auth, clock, fraud, score, services
+from .db import TABLES, Database, init_db, transaction
+
+# Sample logins for the demo (shown on the login page). Every seeded account uses this PIN.
+DEMO_PIN = "1234"
 
 CITY = "Delhi"
 RAJU = (28.67312, 77.28654)     # Raju Kabadi Store
@@ -41,9 +44,9 @@ DEALERS = [
 
 
 def _wipe(conn):
-    for t in ["messages", "fraud_flags", "loans", "scores", "transactions", "batches", "recycler_sales",
-              "upi_events", "payments", "sale_requests", "dealers", "collectors", "groups"]:
-        conn.execute(f"DELETE FROM {t}")
+    for t in reversed(TABLES):
+        if t != "materials":
+            conn.execute(f"DELETE FROM {t}")
 
 
 def _at(base: datetime, days_ago: int, hour: int, minute: int = 0) -> datetime:
@@ -52,7 +55,32 @@ def _at(base: datetime, days_ago: int, hour: int, minute: int = 0) -> datetime:
     return d + timedelta(hours=hour, minutes=minute)
 
 
-def seed(conn, wipe: bool = False) -> None:
+def seed(db: Database, wipe: bool = False) -> None:
+    """Postgres: build in an in-memory SQLite (thousands of small queries, fast locally), then bulk-copy,
+    so a reset over the network takes seconds rather than minutes."""
+    if not db.is_pg:
+        _build(db, wipe)
+        return
+    mem = Database(path=":memory:")
+    _build(mem, wipe=False)
+    _copy(mem, db)
+
+
+def _copy(src: Database, dst: Database) -> None:
+    with transaction(dst):
+        dst.execute(f"TRUNCATE {', '.join(TABLES)} RESTART IDENTITY CASCADE")
+        for t in TABLES:
+            data = [dict(r) for r in src.execute(f"SELECT * FROM {t}").fetchall()]
+            if not data:
+                continue
+            cols = list(data[0].keys())
+            dst.executemany(f"INSERT INTO {t} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                            [tuple(r[c] for c in cols) for r in data])
+            if "id" in cols:
+                dst.execute(f"SELECT setval(pg_get_serial_sequence('{t}', 'id'), (SELECT MAX(id) FROM {t}))")
+
+
+def _build(conn: Database, wipe: bool) -> None:
     rng = random.Random(42)
     real_now = clock.now()
     init_db(conn)
@@ -64,18 +92,21 @@ def seed(conn, wipe: bool = False) -> None:
         for name, phone, lang, days, guarantee, equip, vpa, qr in COLLECTORS:
             joined = clock.ts(real_now - timedelta(days=days, hours=2))
             cur = conn.execute(
-                "INSERT INTO collectors (name, phone, language, id_type, id_ref_hash, group_id, group_guarantee, "
-                "qr_token, upi_vpa, equipment, consent_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (name, phone, lang, "e-Shram", hashlib.sha256(f"demo-salt:{phone}".encode()).hexdigest(),
+                "INSERT INTO collectors (name, phone, pin_hash, language, id_type, id_ref_hash, group_id, "
+                "group_guarantee, qr_token, upi_vpa, equipment, consent_at, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (name, phone, auth.hash_pin(DEMO_PIN), lang, "e-Shram",
+                 hashlib.sha256(f"demo-salt:{phone}".encode()).hexdigest(),
                  1, guarantee, qr, vpa, equip, joined, joined))
             cids[name.split()[0]] = cur.lastrowid
         conn.execute("UPDATE groups SET leader_id = ? WHERE id = 1", (cids["Lakshmi"],))
         dids = {}
         for shop, owner, phone, lat, lng, scale_id, vpa, rep in DEALERS:
             cur = conn.execute(
-                "INSERT INTO dealers (shop_name, owner_name, phone, lat, lng, scale_id, upi_vpa, reputation, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (shop, owner, phone, lat, lng, scale_id, vpa, rep, clock.ts(real_now - timedelta(days=300))))
+                "INSERT INTO dealers (shop_name, owner_name, phone, pin_hash, lat, lng, scale_id, upi_vpa, "
+                "reputation, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (shop, owner, phone, auth.hash_pin(DEMO_PIN), lat, lng, scale_id, vpa, rep,
+                 clock.ts(real_now - timedelta(days=300))))
             dids[shop.split()[0]] = cur.lastrowid
         dealer_vpa = {dids["Raju"]: DEALERS[0][6], dids["Gupta"]: DEALERS[1][6]}
         dealer_loc = {dids["Raju"]: RAJU, dids["Gupta"]: GUPTA}
@@ -196,6 +227,7 @@ def _replay_sale(conn, cid, did, mat, est, kg, loc, payer_vpa, payee_vpa):
 if __name__ == "__main__":
     from .db import connect
     c = connect()
+    init_db(c)
     seed(c, wipe=True)
     for r in c.execute("SELECT c.name, s.score FROM collectors c JOIN scores s ON s.collector_id = c.id"):
         print(f"{r[0]:<16} {r[1]}")

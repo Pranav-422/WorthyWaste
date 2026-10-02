@@ -8,7 +8,7 @@ Specs: `WorthyWaste — PRD.md`, `WorthyWaste — Tech Spec.md`, `WorthyWaste �
 ## Run it
 
 ```bash
-# 1. API (FastAPI + SQLite). Seeds demo data on first start.
+# 1. API (FastAPI; SQLite locally, Postgres when DATABASE_URL is set). Seeds demo data on first start.
 cd backend
 python -m venv .venv
 .venv/Scripts/pip install -r requirements-dev.txt    # macOS/Linux: .venv/bin/pip
@@ -20,13 +20,30 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000. `/demo` shows two phones and the Satin laptop side by side for recording.
+Open http://localhost:3000. The API lives under `/api` (health check: `/api/health`, docs: `/api/docs`).
 
 | Route | Who | |
 | --- | --- | --- |
-| `/collector?id=1` | Meena (collector) | QR card, new sale, waiting, ₹ received, score |
-| `/dealer?id=1` | Raju Kabadi Store | Request queue, scan, weigh, approve and pay, today, sell to recycler |
+| `/` | Everyone | Public web page: problem, how it works, who it serves, fraud checks, score |
+| `/login` | Collectors and dealers | Phone + 4-digit PIN, with tap-to-fill sample accounts |
+| `/collector` | Logged-in collector | QR card, new sale, waiting, ₹ received, score |
+| `/dealer` | Logged-in dealer | Request queue, scan, weigh, approve and pay, today, sell to recycler |
 | `/satin` | Satin branch manager | Overview, collectors, profile + eligibility, fraud flags, groups, impact |
+| `/demo` | Recording | Two phones and the Satin laptop side by side (log in inside each phone once) |
+
+**Sample logins** (seeded, PIN `1234` for all):
+
+| Role | Account | Phone |
+| --- | --- | --- |
+| Collector | Meena Devi (demo hero) | 9810000001 |
+| Collector | Sunita Kumari (new, not yet eligible) | 9810000002 |
+| Collector | Lakshmi Bai (repaid a loan) | 9810000003 |
+| Dealer | Raju Kabadi Store (demo dealer) | 9811000001 |
+| Dealer | Gupta Scrap Traders (mass-balance flag) | 9811000002 |
+
+Login sets an httpOnly cookie per role (`ww_collector`, `ww_dealer`), so a collector and a dealer can be signed in
+in the same browser. The API checks it on every collector and dealer action, and a user can act only as themselves.
+The Satin dashboard has no login in this demo; it shows sample data only.
 
 `WW_SCRIPTED=1` makes the simulated scale read est × 0.978, so 28 kg always becomes 27.4 kg and every take matches the script.
 Add `&demo=0` to the collector or dealer URLs to hide the demo shortcuts and use real GPS.
@@ -70,10 +87,11 @@ backend/.venv/Scripts/python scripts/make_audio.py
 | Piece | Demo | Pilot swap |
 | --- | --- | --- |
 | Scale | `SimulatedScale` | BLE scale (`ScaleAdapter`) |
-| UPI | `MockUpi`, webhook after 1 s | Aggregator collect/payout + signed webhook (`PaymentAdapter`) |
+| UPI | `MockUpi`, settles ~1 s after approve, on the next status check | Aggregator collect/payout + signed webhook (`PaymentAdapter`) |
 | Voice / WhatsApp / IVR | Stored messages, spoken by the browser | IVR + WhatsApp Business provider (`MessageAdapter`) |
 | KYC | Skipped; ID stored only as a salted hash | Run through Satin (`KycAdapter`) |
-| Photo check | Real perceptual hash (`imagehash`), Hamming ≤ 6 over 30 days | Same |
+| Photo check | Real perceptual hash (`app/phash.py`, same output as `imagehash`), Hamming ≤ 6 over 30 days | Same |
+| Login | Phone + PIN (PBKDF2), signed session cookie | OTP via the SMS provider; rate limits in the database |
 | Fraud rules, score v1, eligibility | Real, per Tech Spec | Thresholds tuned on pilot data |
 
 ## Tests
@@ -84,14 +102,40 @@ cd frontend && npm test          # voice composition, and that every segment it 
 ```
 
 `tests/test_demo_flow.py` runs the whole click path against a fresh database and asserts ₹340, the duplicate-photo block,
-score 642 and the unlocked ₹5,000 loan. If you change the seed, this test tells you whether the script still holds.
+score 642 and the unlocked ₹5,000 loan, plus logins and sessions. If you change the seed, this test tells you whether
+the script still holds.
 
-## Deploy
+The same tests run against Postgres when `DATABASE_URL` is set. Without installing Postgres, PGlite works:
 
-- **API → Render.** New → Blueprint → pick this repo; `render.yaml` sets everything up. The free plan sleeps after
-  15 idle minutes and its disk is wiped on restart, so the API re-seeds fresh demo data on each cold start.
-  Open `/health` a minute before recording to wake it.
-- **Front end → Vercel**, root directory `frontend`, with `API_URL` set to the Render URL at build time
-  (rewrites are fixed at build): `vercel deploy --prod --cwd frontend --build-env API_URL=https://<api>.onrender.com`.
+```bash
+npx @electric-sql/pglite-socket --port=55432 &       # in-memory Postgres
+DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:55432/postgres?sslmode=disable"   backend/.venv/Scripts/python -m pytest -q backend/tests
+```
 
-`POST /api/demo/reset` is open on purpose for the demo; set `WW_ALLOW_RESET=0` on any non-demo deployment.
+## Deploy (Vercel only)
+
+One Vercel project runs both halves with [Vercel Services](https://vercel.com/docs/services) (beta, all plans).
+The root `vercel.json` defines a `web` service (Next.js, `frontend/`) and an `api` service (FastAPI, `backend/`),
+and routes `/api/*` to the API and everything else to the web app, on one domain. Data lives in Postgres.
+
+1. **Create the project.** Import `Pranav-422/WorthyWaste` at vercel.com/new and keep the **root directory as the
+   repo root**, so Vercel reads `vercel.json` and builds both services.
+2. **Add Postgres.** Project → Storage → Create → **Neon** (Vercel Marketplace) → connect it to the project. This adds
+   `DATABASE_URL` for all environments; the API also accepts `POSTGRES_URL`.
+3. **Set environment variables** (Project → Settings → Environment Variables, all environments):
+
+   | Name | Value | Why |
+   | --- | --- | --- |
+   | `WW_SECRET` | 32+ random characters, e.g. `openssl rand -hex 32` | Signs login sessions. Shared by both services, so the web app can check them. Required in production. |
+   | `WW_SCRIPTED` | `1` | Scripted scale (28 kg → 27.4 kg), so the recording matches every take |
+   | `WW_ALLOW_RESET` | `1` for the demo, `0` otherwise | `POST /api/demo/reset` is open while this is `1` |
+
+4. **Deploy.** Push to `main`, or run `vercel deploy --prod` from the repo root. On first start the API creates its
+   tables and seeds the demo data (an advisory lock stops two cold starts from seeding twice).
+5. **Check:** `/api/health` should report `"db": "postgres"`; then log in with the sample accounts above.
+
+Notes:
+
+- Photos are stored in Postgres (`photos` table), because function instances don't share a disk.
+- The mock UPI payment settles when the app next checks the request, since serverless functions don't run background timers.
+- To try the Services setup locally without a Vercel login: `npx vercel dev -L` from the repo root.

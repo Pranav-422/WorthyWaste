@@ -1,16 +1,13 @@
 """Transaction flow: request → accept → weigh → approve → payment webhook → transaction.
 A sale becomes a transaction only once payment succeeds."""
-import io
 import json
 import secrets
 import uuid
 from datetime import timedelta
 
-import imagehash
-from PIL import Image
 
-from . import adapters, clock, fraud, score
-from .db import PHOTO_DIR, one, rows
+from . import adapters, clock, fraud, phash, score
+from .db import one, rows
 
 REQUEST_TTL_MIN = 15
 CREDITS_PER_KG = 1
@@ -50,8 +47,7 @@ def material(conn, code: str) -> dict:
 
 
 def photo_phash(data: bytes) -> str:
-    img = Image.open(io.BytesIO(data))
-    return str(imagehash.phash(img))
+    return phash.phash(data)
 
 
 # ---------- Step 1: collector raises a request ----------
@@ -65,11 +61,11 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
     if not (0 < est_kg <= 500):
         raise ApiError(400, "Estimated weight must be between 0 and 500 kg")
     try:
-        phash = photo_phash(photo)
+        phash_hex = photo_phash(photo)
     except Exception:
         raise ApiError(400, "Photo could not be read")
 
-    dup = fraud.find_duplicate_photo(conn, phash)
+    dup = fraud.find_duplicate_photo(conn, phash_hex)
     if dup:
         same = dup["collector_id"] == collector_id
         flag = lambda c: fraud.raise_flag(  # noqa: E731
@@ -81,12 +77,12 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
         raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
 
     name = f"{uuid.uuid4().hex}.jpg"
-    (PHOTO_DIR / name).write_bytes(photo)
+    conn.execute("INSERT INTO photos (name, data, created_at) VALUES (?,?,?)", (name, photo, clock.ts()))
     now = clock.now()
     cur = conn.execute(
         "INSERT INTO sale_requests (collector_id, material, est_kg, photo_url, photo_phash, lat, lng, "
         "status, created_at, expires_at) VALUES (?,?,?,?,?,?,?, 'open', ?, ?)",
-        (collector_id, material_code, est_kg, f"/photos/{name}", phash, lat, lng,
+        (collector_id, material_code, est_kg, f"/api/photos/{name}", phash_hex, lat, lng,
          clock.ts(now), clock.ts(now + timedelta(minutes=REQUEST_TTL_MIN))),
     )
     return get_request(conn, cur.lastrowid)
@@ -198,6 +194,18 @@ def payment_webhook(conn, provider_ref: str, status: str) -> dict:
     tx = record_transaction(conn, req, amount=p["amount"], upi_ref=provider_ref,
                             payer_vpa=p["payer_vpa"], payee_vpa=p["payee_vpa"])
     return {"payment": {**p, "status": "success"}, "transaction": tx}
+
+
+def settle_mock_payment(conn, request_id: int) -> None:
+    """Stand-in for the provider's webhook when using the mock UPI adapter."""
+    after = adapters.payments.settles_after_s
+    if after is None:
+        return
+    cutoff = clock.ts(clock.now() - timedelta(seconds=after))
+    for p in rows(conn.execute(
+            "SELECT provider_ref FROM payments WHERE request_id = ? AND status = 'pending' AND created_at <= ?",
+            (request_id, cutoff))):
+        payment_webhook(conn, p["provider_ref"], "success")
 
 
 def record_transaction(conn, req: dict, *, amount: float, upi_ref: str,
