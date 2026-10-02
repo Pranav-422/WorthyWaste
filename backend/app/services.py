@@ -17,9 +17,14 @@ CREDITS_PER_KG = 1
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str, rule: str | None = None, evidence: dict | None = None):
+    """A refused request. The request's transaction rolls back; `persist` holds writes that must
+    survive anyway (e.g. the fraud flag explaining why it was refused), run in a fresh transaction."""
+
+    def __init__(self, status: int, message: str, rule: str | None = None, evidence: dict | None = None,
+                 persist=None):
         super().__init__(message)
         self.status, self.message, self.rule, self.evidence = status, message, rule, evidence or {}
+        self.persist = persist or []
 
 
 def expire_stale(conn) -> None:
@@ -67,13 +72,13 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
     dup = fraud.find_duplicate_photo(conn, phash)
     if dup:
         same = dup["collector_id"] == collector_id
-        fraud.raise_flag(
-            conn, entity_type="collector", entity_id=collector_id, rule="duplicate_photo",
+        flag = lambda c: fraud.raise_flag(  # noqa: E731
+            c, entity_type="collector", entity_id=collector_id, rule="duplicate_photo",
             detail=("Reused a photo from" if same else "Used another collector's photo from")
                    + f" request #{dup['request_id']} (hash distance {dup['distance']})",
             evidence=dup, collector_id=collector_id, dedupe_hours=1,
         )
-        raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup)
+        raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
 
     name = f"{uuid.uuid4().hex}.jpg"
     (PHOTO_DIR / name).write_bytes(photo)
@@ -223,7 +228,9 @@ def record_transaction(conn, req: dict, *, amount: float, upi_ref: str,
         c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (req["collector_id"],)))
         channel = "voice" if c["basic_phone"] else "whatsapp"
         adapters.messages.send(conn, c["id"], channel, c["language"],
-                               confirmation_text(c["language"], amount, req["scale_kg"], m, credits))
+                               confirmation_text(c["language"], amount, req["scale_kg"], m, credits),
+                               meta={"kind": "sale_confirmation", "amount": int(round(amount)),
+                                     "kg": req["scale_kg"], "material": m["code"], "credits": credits})
         score.recompute(conn, c["id"])
     return one(conn.execute("SELECT * FROM transactions WHERE id = ?", (cur.lastrowid,)))
 

@@ -100,7 +100,15 @@ export type Collector = {
   city?: string;
 };
 
-export type Message = { id: number; channel: string; language: string; text: string; created_at: string };
+export type Message = {
+  id: number;
+  channel: string;
+  language: string;
+  text: string;
+  /** Structured fields for voicing, e.g. { kind: "sale_confirmation", amount, kg, material, credits }. */
+  meta: Record<string, unknown> | null;
+  created_at: string;
+};
 
 export type Loan = {
   id: number;

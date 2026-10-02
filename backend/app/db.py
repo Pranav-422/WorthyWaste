@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS messages (
   channel      TEXT NOT NULL,             -- voice, whatsapp, ivr
   language     TEXT NOT NULL,
   text         TEXT NOT NULL,
+  meta_json    TEXT,                      -- structured fields, so the app can voice any amount
   created_at   TEXT NOT NULL
 );
 
@@ -209,6 +210,9 @@ def connect() -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     conn.executescript(SCHEMA)
+    # Additive migrations for databases created by an earlier version.
+    if "meta_json" not in {r[1] for r in conn.execute("PRAGMA table_info(messages)")}:
+        conn.execute("ALTER TABLE messages ADD COLUMN meta_json TEXT")
     conn.executemany(
         "INSERT OR IGNORE INTO materials (code, label_en, label_hi, rate_per_kg, co2e_per_kg) VALUES (?,?,?,?,?)",
         MATERIALS,

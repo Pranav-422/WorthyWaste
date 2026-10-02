@@ -16,6 +16,10 @@ MIN_DAYS_ON_PLATFORM = 30
 MIN_VERIFIED_SALES = 20
 # First loan ≈ ₹5,000; limit steps up after each cycle repaid on time.
 LOAN_LADDER = [5000, 10000, 15000, 25000]
+# Open flags on these rules hold eligibility until Satin reviews them: each one is about a sale or
+# payment that actually went through. A duplicate photo is blocked before any money moves, so it is
+# shown to Satin but only freezes eligibility once confirmed.
+HOLDING_RULES = ("weight_gap", "volume_outlier", "circular_payment", "pair_frequency")
 
 
 def _clip(x: float) -> float:
@@ -55,8 +59,10 @@ def compute_inputs(conn, collector_id: int) -> dict:
         cv = statistics.pstdev(monthly) / statistics.mean(monthly)
         C = _clip(1 - cv)
     else:
+        # Too little history to judge consistency: neutral, like R before a first loan,
+        # so newcomers are not scored as if their income were erratic.
         cv = None
-        C = 0.0
+        C = 0.5
 
     # T — months on platform ÷ 12.
     days_on = (now - joined).days
@@ -82,7 +88,7 @@ def compute_inputs(conn, collector_id: int) -> dict:
         "C": {"value": round(C, 3), "weight": WEIGHTS["C"], "label": "Consistency",
               "why": (f"Monthly income ₹{', ₹'.join(f'{m:,.0f}' for m in reversed(monthly))}; "
                       f"variation {cv:.0%}") if cv is not None
-                     else "Not enough history yet (needs 2 full months)",
+                     else "Under 2 months of history — neutral 0.5",
               "monthly_income": [round(m) for m in reversed(monthly)]},
         "T": {"value": round(T, 3), "weight": WEIGHTS["T"], "label": "Tenure",
               "why": f"{days_on // 30} months {days_on % 30} days on WorthyWaste (full marks at 12 months)"},
@@ -134,6 +140,11 @@ def eligibility(conn, collector_id: int) -> dict:
         "SELECT COUNT(*) FROM fraud_flags WHERE collector_id = ? AND status = 'open'",
         (collector_id,),
     ).fetchone()[0]
+    held_by = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT rule FROM fraud_flags WHERE collector_id = ? AND status = 'open' "
+        f"AND rule IN ({','.join('?' * len(HOLDING_RULES))})",
+        (collector_id, *HOLDING_RULES),
+    )]
     active_loan = conn.execute(
         "SELECT COUNT(*) FROM loans WHERE collector_id = ? AND status = 'active'", (collector_id,)
     ).fetchone()[0]
@@ -150,7 +161,11 @@ def eligibility(conn, collector_id: int) -> dict:
          "label": f"{MIN_VERIFIED_SALES}+ verified sales", "detail": f"{sales} sales"},
         {"key": "fraud", "ok": confirmed_flags == 0,
          "label": "No confirmed fraud flag",
-         "detail": f"{confirmed_flags} confirmed, {open_flags} under review"},
+         "detail": f"{confirmed_flags} confirmed"},
+        {"key": "review", "ok": not held_by,
+         "label": "No sale under fraud review",
+         "detail": ("On hold: " + ", ".join(r.replace("_", " ") for r in held_by)) if held_by
+                   else f"{open_flags} open flag{'s' if open_flags != 1 else ''}, none holding"},
         {"key": "group", "ok": bool(c["group_id"] and c["group_guarantee"]),
          "label": "Group guarantee recorded", "detail": "Recorded" if c["group_guarantee"] else "Missing"},
         {"key": "no_active", "ok": active_loan == 0,

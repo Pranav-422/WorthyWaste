@@ -5,8 +5,8 @@ import { ApiError, get, postForm } from "@/lib/api";
 import { kg, mmss, parseTs, rupees, shortDate } from "@/lib/format";
 import { t, voice, type Lang } from "@/lib/i18n";
 import { getLocation } from "@/lib/location";
-import { speak } from "@/lib/speech";
-import type { CollectorProfile, Material, SaleRequest, Transaction } from "@/lib/types";
+import { speak, speakMessage } from "@/lib/speech";
+import type { CollectorProfile, Material, Message, SaleRequest, Transaction } from "@/lib/types";
 import { LiveCamera } from "@/components/LiveCamera";
 import { QrCode } from "@/components/QrCode";
 import { ScoreMeter } from "@/components/ScoreMeter";
@@ -102,7 +102,7 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
               setScreen("received");
               load().then((p) => {
                 const msg = p.messages[0];
-                if (msg) speak(msg.text, msg.language as Lang);
+                if (msg) speakMessage(msg);
               });
             }}
             onCancel={() => {
@@ -116,7 +116,7 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
             tx={lastTx}
             lang={lang}
             matLabel={matLabel}
-            message={profile.messages[0]?.text}
+            message={profile.messages[0]}
             onDone={() => {
               setScreen("home");
               setTab("wallet");
@@ -196,7 +196,7 @@ function Home({
                 {profile.messages.slice(0, 3).map((m) => (
                   <button
                     key={m.id}
-                    onClick={() => speak(m.text, m.language as Lang)}
+                    onClick={() => speakMessage(m)}
                     className="flex w-full items-start gap-2 border-t border-line py-2 text-left text-sm first:border-0"
                   >
                     <SpeakerIcon className="mt-0.5 h-4 w-4 shrink-0 text-leaf" />
@@ -549,7 +549,7 @@ function Received({
   tx: Transaction;
   lang: Lang;
   matLabel: (c: string) => string;
-  message?: string;
+  message?: Message;
   onDone: () => void;
 }) {
   return (
@@ -566,7 +566,7 @@ function Received({
         <p className="mt-3 font-semibold">+{tx.credits} {t(lang, "credits")}</p>
       </div>
       {message && (
-        <button onClick={() => speak(message, lang)} className="flex items-center gap-2 rounded-full bg-ink px-5 py-3 font-semibold text-kraft">
+        <button onClick={() => speakMessage(message)} className="flex items-center gap-2 rounded-full bg-ink px-5 py-3 font-semibold text-kraft">
           <SpeakerIcon className="h-5 w-5" /> {lang === "hi" ? "फिर से सुनें" : "Play again"}
         </button>
       )}

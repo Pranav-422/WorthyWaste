@@ -2,7 +2,7 @@
 import json
 import os
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
@@ -24,10 +24,24 @@ init_db(_conn)
 _lock = threading.Lock()
 
 
-def db():
+@contextmanager
+def _tx():
+    """One locked transaction; on ApiError, still record what the refusal says must be kept."""
     with _lock:
-        with transaction(_conn):
-            yield _conn
+        try:
+            with transaction(_conn):
+                yield _conn
+        except ApiError as e:
+            if e.persist:
+                with transaction(_conn):
+                    for write in e.persist:
+                        write(_conn)
+            raise
+
+
+def db():
+    with _tx() as conn:
+        yield conn
 
 
 @asynccontextmanager
@@ -114,8 +128,8 @@ def collector_profile(collector_id: int, conn=Depends(db)):
             "WHERE t.collector_id = ? ORDER BY t.created_at DESC LIMIT 50", (collector_id,))),
         "requests": rows(conn.execute(
             "SELECT * FROM sale_requests WHERE collector_id = ? ORDER BY id DESC LIMIT 10", (collector_id,))),
-        "messages": rows(conn.execute(
-            "SELECT * FROM messages WHERE collector_id = ? ORDER BY id DESC LIMIT 10", (collector_id,))),
+        "messages": [{**m, "meta": services.json_load(m.pop("meta_json"))} for m in rows(conn.execute(
+            "SELECT * FROM messages WHERE collector_id = ? ORDER BY id DESC LIMIT 10", (collector_id,)))],
         "loans": rows(conn.execute("SELECT * FROM loans WHERE collector_id = ? ORDER BY id DESC", (collector_id,))),
         "flags": rows(conn.execute(
             "SELECT * FROM fraud_flags WHERE collector_id = ? ORDER BY id DESC", (collector_id,))),
@@ -195,8 +209,8 @@ async def create_request(
     data = await photo.read()
     if len(data) > 5_000_000:
         raise ApiError(413, "Photo too large")
-    with _lock, transaction(_conn):
-        return services.create_request(_conn, collector_id=collector_id, material_code=material,
+    with _tx() as conn:
+        return services.create_request(conn, collector_id=collector_id, material_code=material,
                                        est_kg=est_kg, lat=lat, lng=lng, photo=data)
 
 

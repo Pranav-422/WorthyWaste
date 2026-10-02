@@ -44,13 +44,21 @@ Add `&demo=0` to the collector or dealer URLs to hide the demo shortcuts and use
 8. Satin → Collectors → Meena → score **642**, five inputs shown → *Starter loan unlocked · ₹5,000*.
 
 Also seeded: a volume outlier (Farida, 180 kg in one day) and a mass-balance gap (Gupta, 32%).
+
+Loan eligibility is held while a flag about a completed sale or payment (weight gap, volume outlier, circular
+payment, pair frequency) is open; Satin confirming or dismissing it decides. A duplicate photo is refused before
+any money moves, so it is logged for Satin but only freezes eligibility once confirmed, which is why Meena stays
+eligible after step 6.
 The dealer's location menu has a "1 km away" option, which shows the GPS block.
 
 ## Voice
 
-Phones and laptops often have no Hindi speech voice, so the collector app's fixed prompts and the scripted
-₹340 confirmation play pre-recorded clips from `frontend/public/audio/` (listed in `frontend/lib/audio-clips.json`).
-Any other text falls back to the browser's speech engine. If you change a prompt in `lib/i18n.ts` or the confirmation
+Phones and laptops often have no Hindi speech voice, so the collector app never relies on one:
+
+- Fixed prompts and the scripted ₹340 confirmation play whole pre-recorded clips (`frontend/lib/audio-clips.json`).
+- A sale confirmation of any other amount is joined from recorded segments (numbers 1–99, सौ, हज़ार, दशमलव,
+  material names) by `frontend/lib/voiceCompose.ts`, with the silence between them trimmed.
+- Anything else falls back to the browser's speech engine. If you change a prompt in `lib/i18n.ts` or the confirmation
 text in `backend/app/services.py`, regenerate the clips (needs network, `pip install edge-tts`):
 
 ```bash
@@ -72,6 +80,7 @@ backend/.venv/Scripts/python scripts/make_audio.py
 
 ```bash
 cd backend && .venv/Scripts/python -m pytest -q
+cd frontend && npm test          # voice composition, and that every segment it can ask for exists
 ```
 
 `tests/test_demo_flow.py` runs the whole click path against a fresh database and asserts ₹340, the duplicate-photo block,

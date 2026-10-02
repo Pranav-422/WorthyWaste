@@ -66,17 +66,21 @@ def new_upi_ref() -> str:
 
 class MessageAdapter(ABC):
     @abstractmethod
-    def send(self, conn, collector_id: int, channel: str, language: str, text: str) -> None: ...
+    def send(self, conn, collector_id: int, channel: str, language: str, text: str,
+             meta: dict | None = None) -> None: ...
 
 
 class OnScreenMessages(MessageAdapter):
     """Demo: messages are stored and shown on the collector screen (and spoken by the browser)."""
 
-    def send(self, conn, collector_id: int, channel: str, language: str, text: str) -> None:
+    def send(self, conn, collector_id: int, channel: str, language: str, text: str,
+             meta: dict | None = None) -> None:
+        import json
         from .clock import ts
         conn.execute(
-            "INSERT INTO messages (collector_id, channel, language, text, created_at) VALUES (?,?,?,?,?)",
-            (collector_id, channel, language, text, ts()),
+            "INSERT INTO messages (collector_id, channel, language, text, meta_json, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (collector_id, channel, language, text, json.dumps(meta) if meta else None, ts()),
         )
 
 

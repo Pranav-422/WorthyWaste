@@ -98,6 +98,11 @@ def test_demo_click_path(client):
     assert r.status_code == 409
     assert r.json()["error"] == "This photo was already used"
 
+    # The refused attempt is still on record for Satin, but doesn't hold her loan (no money moved).
+    dup_flags = [f for f in client.get("/flags?status=open").json()
+                 if f["rule"] == "duplicate_photo" and f["collector_id"] == meena["id"]]
+    assert len(dup_flags) == 1
+
     # 8. Meena's profile: 642, starter loan unlocked.
     prof = client.get(f"/collectors/{meena['id']}").json()
     assert prof["score"]["score"] == 642, prof["score"]
@@ -149,3 +154,29 @@ def test_ivr_path(client):
     assert bad.status_code == 403
     ok = client.post("/ivr/confirm", json={"request_id": rid, "caller_phone": s["phone"], "digit": "1"})
     assert ok.json()["status"] == "accepted"
+
+
+def test_open_sale_flag_holds_eligibility(client):
+    collectors, _ = ids(client)
+    farida = collectors["Farida"]["id"]
+    el = client.get(f"/collectors/{farida}").json()["eligibility"]
+    review = next(c for c in el["checks"] if c["key"] == "review")
+    assert not el["eligible"] and not review["ok"] and "volume outlier" in review["detail"]
+    flag = next(f for f in client.get("/flags?status=open").json()
+                if f["collector_id"] == farida and f["rule"] == "volume_outlier")
+    client.post(f"/flags/{flag['id']}", json={"status": "dismissed"})
+    assert client.get(f"/collectors/{farida}").json()["eligibility"]["eligible"]
+    assert client.post("/loans", json={"collector_id": collectors["Ramesh"]["id"]}).status_code == 409
+
+
+def test_newcomer_consistency_is_neutral(client):
+    collectors, _ = ids(client)
+    c = client.get(f"/collectors/{collectors['Sunita']['id']}").json()["score"]["inputs"]["C"]
+    assert c["value"] == 0.5
+
+
+def test_confirmation_carries_voice_fields(client):
+    collectors, _ = ids(client)
+    msg = client.get(f"/collectors/{collectors['Meena']['id']}").json()["messages"][0]
+    assert msg["meta"] == {"kind": "sale_confirmation", "amount": 340, "kg": 27.4,
+                           "material": "plastic", "credits": 27}
