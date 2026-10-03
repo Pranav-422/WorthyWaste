@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, get, post } from "@/lib/api";
+import { ApiError, get, logout, post } from "@/lib/api";
 import { kg, rupees, shortDate, timeAgo } from "@/lib/format";
 import type { CollectorProfile, Flag, MassBalance } from "@/lib/types";
 import { BarList, ColumnChart } from "@/components/BarChart";
@@ -43,7 +43,12 @@ type Group = {
   members: { id: number; name: string; group_guarantee: number; score: number | null; loan_status: string | null; repayment: string }[];
 };
 
-export function SatinApp() {
+/**
+ * `demoKey` is the X-Demo-Key secret for POST /api/demo/reset, passed in by the server page only
+ * for a signed-in branch manager and only when WW_ALLOW_RESET=1. Null means the reset button is not
+ * shown, which is the production case.
+ */
+export function SatinApp({ demoKey }: { demoKey: string | null }) {
   const [view, setView] = useState<View>("overview");
   const [openCollector, setOpenCollector] = useState<number | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -111,17 +116,24 @@ export function SatinApp() {
             </button>
           ))}
         </nav>
-        <button
-          onClick={async () => {
-            if (!confirm("Reset all demo data?")) return;
-            await post("/demo/reset");
-            setOpenCollector(null);
-            refresh();
-          }}
-          className="mx-5 mb-4 hidden text-xs text-kraft/50 underline lg:block"
-        >
-          Reset demo data
-        </button>
+        <div className="mx-5 mb-4 hidden gap-4 lg:flex">
+          <button onClick={() => logout("satin")} className="text-xs text-kraft/70 underline">
+            Log out
+          </button>
+          {demoKey && (
+            <button
+              onClick={async () => {
+                if (!confirm("Reset all demo data?")) return;
+                await post("/demo/reset", undefined, { "X-Demo-Key": demoKey });
+                setOpenCollector(null);
+                refresh();
+              }}
+              className="text-xs text-kraft/50 underline"
+            >
+              Reset demo data
+            </button>
+          )}
+        </div>
       </aside>
 
       <main className="min-w-0 px-4 py-6 lg:px-8">
@@ -469,6 +481,7 @@ function FlagsView({ flags, onChanged, onCollector }: { flags: Flag[]; onChanged
                   {f.collector_name && f.shop_name && " · "}
                   {f.shop_name}
                 </p>
+                {f.rule === "photo_mismatch" && <PhotoMismatchCard evidence={f.evidence} />}
                 {f.evidence && Object.keys(f.evidence).length > 0 && (
                   <details className="mt-2 text-xs">
                     <summary className="cursor-pointer text-slate">Evidence</summary>
@@ -500,6 +513,74 @@ function FlagsView({ flags, onChanged, onCollector }: { flags: Flag[]; onChanged
         {shown.length === 0 && <p className="text-slate">Nothing here.</p>}
       </ul>
     </>
+  );
+}
+
+/**
+ * A photo-mismatch flag is a disagreement about what was in the sack, so the card shows all three
+ * accounts side by side — the collector's choice, what the photo check made of their photo, and what
+ * the dealer confirmed at the scale — with the photo itself, so Satin can judge rather than guess.
+ */
+function PhotoMismatchCard({ evidence }: { evidence: Record<string, unknown> | null }) {
+  if (!evidence) return null;
+  const str = (k: string) => (typeof evidence[k] === "string" ? (evidence[k] as string) : null);
+  const photo = str("photo_url");
+  const chose = str("chose");
+  const aiMaterial = str("ai_material");
+  const dealerMaterial = str("dealer_material");
+  const confidence = typeof evidence.ai_confidence === "number" ? evidence.ai_confidence : null;
+  const realScene = evidence.ai_real_scene;
+  const notes = str("ai_notes");
+  const repeats = typeof evidence.repeats === "number" ? evidence.repeats : null;
+
+  return (
+    <div className="mt-3 flex flex-wrap items-start gap-4 rounded-xl border border-line bg-kraft/30 p-3">
+      {photo ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={photo} alt="The photo the collector sent" className="h-28 w-28 rounded-lg object-cover" />
+      ) : (
+        <div className="grid h-28 w-28 place-items-center rounded-lg bg-kraft text-xs text-slate">No photo</div>
+      )}
+      <dl className="min-w-[14rem] flex-1 text-sm">
+        <div className="flex gap-2 py-0.5">
+          <dt className="w-40 shrink-0 text-slate">Collector chose</dt>
+          <dd className="font-semibold">{chose ?? "—"}</dd>
+        </div>
+        <div className="flex gap-2 py-0.5">
+          <dt className="w-40 shrink-0 text-slate">Photo check</dt>
+          <dd>
+            {realScene === 0 ? (
+              <span className="font-semibold text-brick">looks like a photo of a screen</span>
+            ) : aiMaterial ? (
+              <>
+                <span className="font-semibold">{aiMaterial}</span>
+                {confidence != null && <span className="text-slate"> · {Math.round(confidence * 100)}%</span>}
+              </>
+            ) : (
+              <span className="text-slate">not checked</span>
+            )}
+          </dd>
+        </div>
+        <div className="flex gap-2 py-0.5">
+          <dt className="w-40 shrink-0 text-slate">Dealer confirmed</dt>
+          <dd className={dealerMaterial ? "font-semibold text-brick" : "text-slate"}>
+            {dealerMaterial ?? "not corrected at the scale"}
+          </dd>
+        </div>
+        {repeats != null && (
+          <div className="flex gap-2 py-0.5">
+            <dt className="w-40 shrink-0 text-slate">Mismatches in 7 days</dt>
+            <dd className="font-semibold tabular">{repeats}</dd>
+          </div>
+        )}
+        {notes && (
+          <div className="flex gap-2 py-0.5">
+            <dt className="w-40 shrink-0 text-slate">Notes</dt>
+            <dd>{notes}</dd>
+          </div>
+        )}
+      </dl>
+    </div>
   );
 }
 

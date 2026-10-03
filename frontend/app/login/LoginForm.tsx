@@ -6,7 +6,9 @@ import { useState } from "react";
 import { ApiError, post } from "@/lib/api";
 import { Logo, StopIcon } from "@/components/icons";
 
-type Role = "collector" | "dealer";
+type Role = "collector" | "dealer" | "satin";
+
+const ROLES: Role[] = ["collector", "dealer", "satin"];
 
 // Seeded sample accounts (backend/app/seed.py, PIN 1234).
 const DEMO: Record<Role, { name: string; phone: string; note: string }[]> = {
@@ -19,11 +21,15 @@ const DEMO: Record<Role, { name: string; phone: string; note: string }[]> = {
     { name: "Raju Kabadi Store", phone: "9811000001", note: "Demo dealer · balanced books" },
     { name: "Gupta Scrap Traders", phone: "9811000002", note: "Has a mass-balance flag" },
   ],
+  satin: [
+    { name: "Priya Sharma", phone: "9812000001", note: "Branch manager · Narela" },
+  ],
 };
 
 const COPY = {
   collector: { tab: "Collector", tabHi: "कबाड़ बेचने वाले", title: "नमस्ते! लॉग इन करें", sub: "Log in to sell scrap and see your score" },
   dealer: { tab: "Dealer", tabHi: "कबाड़ी दुकान", title: "Dealer login", sub: "Scan, weigh and pay collectors by UPI" },
+  satin: { tab: "Satin", tabHi: "शाखा प्रबंधक", title: "Satin branch login", sub: "Review fraud flags, scores and loans" },
 };
 
 export function LoginForm({ initialRole }: { initialRole: Role }) {
@@ -66,8 +72,8 @@ export function LoginForm({ initialRole }: { initialRole: Role }) {
       </Link>
 
       <div className="mt-6 w-full max-w-md rounded-3xl border border-line bg-paper p-5 shadow-sm sm:p-7">
-        <div role="tablist" aria-label="Who are you?" className="grid grid-cols-2 gap-1 rounded-2xl bg-kraft-deep/60 p-1">
-          {(["collector", "dealer"] as const).map((r) => (
+        <div role="tablist" aria-label="Who are you?" className="grid grid-cols-3 gap-1 rounded-2xl bg-kraft-deep/60 p-1">
+          {ROLES.map((r) => (
             <button
               key={r}
               role="tab"
@@ -164,8 +170,9 @@ export function LoginForm({ initialRole }: { initialRole: Role }) {
         </ul>
       </section>
 
-      <p className="mt-6 text-xs text-slate">
-        Satin branch view needs no login in this demo: <Link href="/satin" className="underline">open dashboard</Link>
+      <p className="mt-6 max-w-md text-center text-xs text-slate">
+        Each role has its own session, so a collector, a dealer and Satin can be signed in side by side
+        in one browser — which is how <Link href="/demo" className="underline">the demo stage</Link> works.
       </p>
     </main>
   );

@@ -6,8 +6,11 @@ import { redirect } from "next/navigation";
 
 // Verifies the session cookies the API sets on login (backend/app/auth.py), so pages can be gated
 // on the server without a round trip. Both sides must share WW_SECRET.
+//
+// One cookie per role (ww_collector, ww_dealer, ww_satin), so a collector, a dealer and the lender
+// can all be signed in in the same browser — which is how the demo stage works.
 
-export type Role = "collector" | "dealer";
+export type Role = "collector" | "dealer" | "satin";
 
 const DEV_SECRET = "worthywaste-dev-secret-change-me";
 
