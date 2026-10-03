@@ -2,13 +2,20 @@
 speech voice. Each clip is keyed by the exact on-screen text; anything not listed here falls back
 to the browser's speech engine.
 
-    backend/.venv/Scripts/python scripts/make_audio.py
+    backend/.venv/Scripts/python scripts/make_audio.py          # only what is missing
+    backend/.venv/Scripts/python scripts/make_audio.py --all     # re-record everything
 
 Needs network: uses Microsoft's neural voices via edge-tts. Only these fixed prompts are sent.
+
+By default existing files are left alone. TTS is not reproducible, so re-recording a prompt whose
+text has not changed would rewrite hundreds of identical-sounding mp3s and bury the real change in
+the diff. A new or edited prompt gets a new filename (the name is a hash of its text), so it is
+picked up either way.
 """
 import asyncio
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import edge_tts
@@ -18,6 +25,8 @@ OUT = ROOT / "frontend" / "public" / "audio"
 MANIFEST = ROOT / "frontend" / "lib" / "audio-clips.json"
 
 VOICES = {"hi": "hi-IN-SwaraNeural", "en": "en-IN-NeerjaNeural"}
+
+FORCE = "--all" in sys.argv
 
 # (lang, text as the app passes it to speak(), text as it should be spoken)
 CLIPS = [
@@ -38,6 +47,41 @@ CLIPS = [
      "Three hundred and forty rupees received for twenty-seven point four kilos of plastic bottles. "
      "Twenty-seven credits added."),
 ]
+
+# The photo check disagreed with the material the collector picked (CollectorApp → PhotoWarning).
+# One line per material, plus one for the cases with no material to name — a mixed load, nothing
+# recyclable, or a photo of a screen. Keys must match mismatchByMaterial in frontend/lib/i18n.ts.
+MISMATCH_TAIL_HI = " — सही चुनें या फिर से फ़ोटो लें"
+MISMATCH_TAIL_EN = " — pick the right one or take the photo again"
+MISMATCH_HEADS = {
+    "hi": {
+        "plastic": "ये प्लास्टिक बोतल लग रही है",
+        "cardboard": "ये गत्ता लग रहा है",
+        "metal": "ये डिब्बे या टिन लग रहे हैं",
+        "paper": "ये अखबार लग रहा है",
+        "wire": "ये तार लग रहा है",
+        "glass": "ये कांच लग रहा है",
+        None: "फ़ोटो आपके चुने हुए कबाड़ से मेल नहीं खा रही",
+    },
+    "en": {
+        "plastic": "This looks like plastic bottles",
+        "cardboard": "This looks like cardboard",
+        "metal": "This looks like cans or tin",
+        "paper": "This looks like newspaper",
+        "wire": "This looks like wire",
+        "glass": "This looks like glass",
+        None: "This photo does not match the scrap you picked",
+    },
+}
+
+for _lang, _heads in MISMATCH_HEADS.items():
+    _tail = MISMATCH_TAIL_HI if _lang == "hi" else MISMATCH_TAIL_EN
+    _spoken_tail = _tail.split("— ")[1]
+    if _lang == "en":
+        _spoken_tail = _spoken_tail[0].upper() + _spoken_tail[1:]
+    for _head in _heads.values():
+        # The em dash is a pause, not a word: the spoken form uses a full stop instead.
+        CLIPS.append((_lang, _head + _tail, f"{_head}. {_spoken_tail}"))
 
 
 # Segments for sale confirmations of any amount, joined in the browser (frontend/lib/voiceCompose.ts).
@@ -80,9 +124,14 @@ async def make_segments():
     for lang, segs in SEGMENTS.items():
         d = OUT / "seg" / lang
         d.mkdir(parents=True, exist_ok=True)
+        made = 0
         for key, text in segs.items():
-            await edge_tts.Communicate(text, VOICES[lang]).save(str(d / f"{key}.mp3"))
-        print(f"{lang}: {len(segs)} segments")
+            path = d / f"{key}.mp3"
+            if path.exists() and not FORCE:
+                continue
+            await edge_tts.Communicate(text, VOICES[lang]).save(str(path))
+            made += 1
+        print(f"{lang}: {len(segs)} segments, {made} recorded")
 
 
 async def main():
@@ -91,8 +140,10 @@ async def main():
     manifest = {}
     for lang, text, spoken in CLIPS:
         name = f"{lang}-{hashlib.sha1(text.encode()).hexdigest()[:10]}.mp3"
-        await edge_tts.Communicate(spoken or text, VOICES[lang], rate="-5%").save(str(OUT / name))
         manifest[text] = f"/audio/{name}"
+        if (OUT / name).exists() and not FORCE:
+            continue
+        await edge_tts.Communicate(spoken or text, VOICES[lang], rate="-5%").save(str(OUT / name))
         print(f"{name}  {text}")
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
