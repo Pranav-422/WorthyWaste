@@ -16,6 +16,9 @@ export type RequestStatus =
   | "rejected"
   | "awaiting_ivr";
 
+/** "unchecked" means the verifier was unavailable, never that the photo looked wrong. */
+export type AiVerdict = "match" | "mismatch" | "uncertain" | "unchecked";
+
 export type SaleRequest = {
   id: number;
   collector_id: number;
@@ -29,6 +32,14 @@ export type SaleRequest = {
   status: RequestStatus;
   gps_distance_m: number | null;
   scale_kg: number | null;
+  /** Photo check (backend/app/adapters.py PhotoVerifier). */
+  ai_material: string | null;
+  ai_confidence: number | null;
+  ai_verdict: AiVerdict | null;
+  ai_notes: string | null;
+  ai_real_scene: number | null;
+  /** What the dealer confirmed at the scale; this is what was paid for and traced. */
+  dealer_material: string | null;
   created_at: string;
   expires_at: string;
   // queue extras
@@ -37,6 +48,18 @@ export type SaleRequest = {
   rate_per_kg?: number;
   distance_m?: number;
   basic_phone?: number;
+};
+
+/** Evidence on a 409 from POST /requests with rule "photo_mismatch". */
+export type PhotoMismatch = {
+  chose: string;
+  chose_label_hi: string;
+  chose_label_en: string;
+  verdict: AiVerdict;
+  material: string | null;
+  confidence: number | null;
+  real_scene: boolean | null;
+  notes: string | null;
 };
 
 export type Transaction = {
