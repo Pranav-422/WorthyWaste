@@ -12,9 +12,9 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from . import auth, clock, fraud, score, services
+from . import adapters, auth, clock, fraud, score, services
 from .db import connect, init_db, one, rows, transaction
 from .services import ApiError
 
@@ -22,6 +22,10 @@ _db = connect()
 # One connection per instance, guarded by a lock. A plain Lock, not an RLock: FastAPI may run a sync
 # dependency's setup and teardown on different worker threads, and only a Lock can be released by a
 # thread other than the one that acquired it. Nothing here acquires it re-entrantly.
+#
+# This lock only protects the one connection inside this process. On Vercel several instances run at
+# once, so it cannot stop two of them accepting or paying the same request: every state change is a
+# guarded UPDATE in services.py (`WHERE ... AND status = <expected>`) that 409s when it matches no row.
 _lock = threading.Lock()
 _ADVISORY_KEY = 7_719_001  # Postgres advisory lock serialising schema setup and seeding across instances
 
@@ -109,14 +113,49 @@ def require_dealer(request: Request) -> int:
     return uid
 
 
+def require_satin(request: Request) -> int:
+    """Satin's dashboard reads collectors' personal data and moves money, so every one of its
+    endpoints needs a branch-staff session — not just the page in front of it."""
+    uid = _session(request, "satin")
+    if uid is None:
+        raise ApiError(401, "Please log in as Satin branch staff")
+    return uid
+
+
+def require_demo_mode() -> None:
+    """Demo-only routes do not exist unless the server is in demo mode, so production cannot be
+    nudged into them by guessing a URL."""
+    if not auth.demo_mode():
+        raise ApiError(404, "Not found")
+
+
+async def provider_payload(request: Request, model: type[BaseModel]):
+    """Body of a call from a payment or IVR provider, verified against WW_PROVIDER_SECRET.
+
+    The signature covers the raw bytes, so the body is read once and parsed here rather than by
+    FastAPI — re-serialising a parsed model would not reproduce what the provider signed."""
+    raw = await request.body()
+    if not auth.verify_provider_signature(raw, request.headers.get(auth.PROVIDER_SIGNATURE_HEADER)):
+        raise ApiError(401, "Missing or invalid X-Provider-Signature")
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError as e:
+        raise ApiError(422, f"Provider payload is not valid: {e.error_count()} problem(s)")
+
+
 def _same(session_id: int, claimed: int | None, what: str) -> int:
     if claimed is not None and claimed != session_id:
         raise ApiError(403, f"You can only act as your own {what} account")
     return session_id
 
 
+# Where each role's accounts live, and which column holds the display name.
+ROLE_TABLE = {"collector": ("collectors", "name"), "dealer": ("dealers", "shop_name"),
+              "satin": ("satin_users", "name")}
+
+
 class LoginBody(BaseModel):
-    role: str = Field(pattern="^(collector|dealer)$")
+    role: str = Field(pattern="^(collector|dealer|satin)$")
     phone: str = Field(min_length=10, max_length=15)
     pin: str = Field(pattern=r"^\d{4}$")
 
@@ -131,10 +170,9 @@ def login(body: LoginBody, request: Request, response: Response, conn=Depends(db
     key = f"{body.role}:{phone}"
     if auth.too_many_attempts(key):
         raise ApiError(429, "Too many wrong PINs. Try again in 10 minutes.")
-    if body.role == "collector":
-        user = one(conn.execute("SELECT id, name, pin_hash FROM collectors WHERE phone = ?", (phone,)))
-    else:
-        user = one(conn.execute("SELECT id, shop_name AS name, pin_hash FROM dealers WHERE phone = ?", (phone,)))
+    table, name_col = ROLE_TABLE[body.role]
+    user = one(conn.execute(
+        f"SELECT id, {name_col} AS name, pin_hash FROM {table} WHERE phone = ?", (phone,)))
     if not user or not auth.verify_pin(body.pin, user["pin_hash"]):
         auth.record_failure(key)
         raise ApiError(401, "Wrong phone number or PIN")
@@ -146,7 +184,7 @@ def login(body: LoginBody, request: Request, response: Response, conn=Depends(db
 
 
 class LogoutBody(BaseModel):
-    role: str = Field(pattern="^(collector|dealer)$")
+    role: str = Field(pattern="^(collector|dealer|satin)$")
 
 
 @api.post("/auth/logout")
@@ -162,8 +200,8 @@ def me(role: str, request: Request, conn=Depends(db)):
     uid = _session(request, role)
     if uid is None:
         raise ApiError(401, "Not logged in")
-    table, name = ("collectors", "name") if role == "collector" else ("dealers", "shop_name")
-    user = one(conn.execute(f"SELECT id, {name} AS name FROM {table} WHERE id = ?", (uid,)))
+    table, name_col = ROLE_TABLE[role]
+    user = one(conn.execute(f"SELECT id, {name_col} AS name FROM {table} WHERE id = ?", (uid,)))
     if not user:
         raise ApiError(401, "Account no longer exists")
     return {"role": role, "user": user}
@@ -174,6 +212,7 @@ def me(role: str, request: Request, conn=Depends(db)):
 @api.get("/health")
 def health():
     return {"ok": True, "time": clock.ts(), "scripted": os.environ.get("WW_SCRIPTED") == "1",
+            "demo_mode": auth.demo_mode(), "photo_check": type(adapters.photo_verifier).__name__,
             "db": "postgres" if _db.is_pg else "sqlite"}
 
 
@@ -194,7 +233,7 @@ def photo(name: str, conn=Depends(db)):
 # ---------- Collectors ----------
 
 @api.get("/collectors")
-def list_collectors(conn=Depends(db)):
+def list_collectors(_satin: int = Depends(require_satin), conn=Depends(db)):
     return rows(conn.execute("""
         SELECT c.id, c.name, c.phone, c.qr_token, c.credits, c.basic_phone, c.created_at,
                g.name AS group_name, s.score,
@@ -205,7 +244,12 @@ def list_collectors(conn=Depends(db)):
         ORDER BY c.id"""))
 
 
-def _collector(conn, collector_id: int) -> dict:
+# Never leaves the backend except to the collector themselves or to Satin: a dealer needs a name to
+# serve the person in front of them, not their phone number, UPI handle or QR token.
+_COLLECTOR_PRIVATE = ("phone", "qr_token", "upi_vpa", "pin_hash", "id_ref_hash", "consent_at")
+
+
+def _collector(conn, collector_id: int, *, full: bool) -> dict:
     c = one(conn.execute(
         "SELECT c.*, g.name AS group_name, g.city FROM collectors c LEFT JOIN groups g ON g.id = c.group_id "
         "WHERE c.id = ?", (collector_id,)))
@@ -213,20 +257,34 @@ def _collector(conn, collector_id: int) -> dict:
         raise ApiError(404, "Collector not found")
     c.pop("id_ref_hash", None)
     c.pop("pin_hash", None)
+    if not full:
+        for k in _COLLECTOR_PRIVATE:
+            c.pop(k, None)
     return c
 
 
 @api.get("/collectors/by-qr/{token}")
-def collector_by_qr(token: str, conn=Depends(db)):
+def collector_by_qr(token: str, request: Request, conn=Depends(db)):
+    """A dealer looking up the card in their hand. They get a name and a group, nothing more."""
+    satin = _session(request, "satin")
+    if satin is None and _session(request, "dealer") is None:
+        raise ApiError(401, "Please log in as a dealer")
     c = one(conn.execute("SELECT id FROM collectors WHERE qr_token = ?", (token,)))
     if not c:
         raise ApiError(404, "Unknown QR card")
-    return _collector(conn, c["id"])
+    return _collector(conn, c["id"], full=satin is not None)
 
 
 @api.get("/collectors/{collector_id}")
-def collector_profile(collector_id: int, conn=Depends(db)):
-    c = _collector(conn, collector_id)
+def collector_profile(collector_id: int, request: Request, conn=Depends(db)):
+    # A collector's full profile — income, flags, loans, score — is for them or for their lender.
+    if _session(request, "satin") is None:
+        me_id = _session(request, "collector")
+        if me_id is None:
+            raise ApiError(401, "Please log in")
+        if me_id != collector_id:
+            raise ApiError(403, "You can only see your own profile")
+    c = _collector(conn, collector_id, full=True)
     services.expire_stale(conn)
     s = one(conn.execute("SELECT * FROM scores WHERE collector_id = ?", (collector_id,)))
     return {
@@ -250,8 +308,8 @@ def collector_profile(collector_id: int, conn=Depends(db)):
 
 
 @api.get("/collectors/{collector_id}/score")
-def collector_score(collector_id: int, conn=Depends(db)):
-    _collector(conn, collector_id)
+def collector_score(collector_id: int, _satin: int = Depends(require_satin), conn=Depends(db)):
+    _collector(conn, collector_id, full=False)
     s = score.recompute(conn, collector_id)
     return {**s, "eligibility": score.eligibility(conn, collector_id)}
 
@@ -260,8 +318,11 @@ def collector_score(collector_id: int, conn=Depends(db)):
 
 @api.get("/dealers")
 def list_dealers(conn=Depends(db)):
-    return [{k: v for k, v in d.items() if k != "pin_hash"}
-            for d in rows(conn.execute("SELECT * FROM dealers ORDER BY id"))]
+    """Shop names and locations, so a collector's app can show who is nearby. A dealer's own phone,
+    UPI handle and PIN hash are only in their own profile below."""
+    return rows(conn.execute(
+        "SELECT id, shop_name, owner_name, lat, lng, scale_id, reputation, created_at "
+        "FROM dealers ORDER BY id"))
 
 
 @api.get("/dealers/{dealer_id}")
@@ -324,6 +385,10 @@ async def create_request(
     material: str = Form(...), est_kg: float = Form(...),
     lat: float | None = Form(None), lng: float | None = Form(None), photo: UploadFile = File(...),
     collector_id: int | None = Form(None),
+    # Set after the collector has seen the photo-check warning and chosen "Send anyway".
+    confirm_mismatch: bool = Form(False),
+    # Demo only (WW_DEMO_MODE=1): script what the photo check "sees", to show the warning on stage.
+    demo_ai_material: str | None = Form(None),
 ):
     me_id = _same(require_collector(request), collector_id, "collector")
     data = await photo.read()
@@ -331,11 +396,26 @@ async def create_request(
         raise ApiError(413, "Photo too large")
     with _tx() as conn:
         return services.create_request(conn, collector_id=me_id, material_code=material,
-                                       est_kg=est_kg, lat=lat, lng=lng, photo=data)
+                                       est_kg=est_kg, lat=lat, lng=lng, photo=data,
+                                       confirm_mismatch=confirm_mismatch,
+                                       demo_ai_material=demo_ai_material)
+
+
+def _may_see_request(request: Request, req: dict) -> bool:
+    if _session(request, "satin") is not None:
+        return True
+    if _session(request, "collector") == req["collector_id"]:
+        return True
+    dealer_id = _session(request, "dealer")
+    # Any signed-in dealer may look at a request nobody has taken yet — those are in their queue.
+    return dealer_id is not None and req["dealer_id"] in (None, dealer_id)
 
 
 @api.get("/requests/{request_id}")
-def get_request(request_id: int, conn=Depends(db)):
+def get_request(request_id: int, request: Request, conn=Depends(db)):
+    req = services.get_request(conn, request_id)
+    if not _may_see_request(request, req):
+        raise ApiError(403, "This sale belongs to someone else")
     services.settle_mock_payment(conn, request_id)
     req = services.get_request(conn, request_id)
     tx = one(conn.execute("SELECT * FROM transactions WHERE request_id = ?", (request_id,)))
@@ -371,12 +451,15 @@ def weigh(request_id: int, body: WeighBody, me_id: int = Depends(require_dealer)
 
 class ApproveBody(BaseModel):
     dealer_id: int | None = None
+    # What the dealer confirmed with the scrap on the scale; defaults to the collector's choice.
+    material: str | None = None
 
 
 @api.post("/requests/{request_id}/approve")
 def approve(request_id: int, body: ApproveBody, me_id: int = Depends(require_dealer), conn=Depends(db)):
     # With the mock UPI adapter the payment settles on the next GET /requests/{id} after ~1 s.
-    return services.approve_request(conn, request_id, dealer_id=_same(me_id, body.dealer_id, "dealer"))
+    return services.approve_request(conn, request_id, dealer_id=_same(me_id, body.dealer_id, "dealer"),
+                                    dealer_material=body.material)
 
 
 class WebhookBody(BaseModel):
@@ -385,8 +468,10 @@ class WebhookBody(BaseModel):
 
 
 @api.post("/payments/webhook")
-def payment_webhook(body: WebhookBody, conn=Depends(db)):
-    # Pilot: verify the aggregator's signature header before trusting this.
+async def payment_webhook(request: Request, conn=Depends(db)):
+    """Called by the payment aggregator. Anyone who could post here unsigned could mark any pending
+    payment successful, so the signature is checked before the body is even parsed."""
+    body: WebhookBody = await provider_payload(request, WebhookBody)
     return services.payment_webhook(conn, body.provider_ref, body.status)
 
 
@@ -398,8 +483,10 @@ class UpiObserved(BaseModel):
 
 
 @api.post("/upi/observed")
-def upi_observed(body: UpiObserved, conn=Depends(db)):
-    """Aggregator feed of transfers between platform VPAs; runs the circular-payment rule."""
+async def upi_observed(request: Request, conn=Depends(db)):
+    """Aggregator feed of transfers between platform VPAs; runs the circular-payment rule.
+    Signed: unsigned posts here could invent a circular payment against any collector."""
+    body: UpiObserved = await provider_payload(request, UpiObserved)
     return services.observe_upi(conn, **body.model_dump())
 
 
@@ -423,8 +510,10 @@ class IvrConfirm(BaseModel):
 
 
 @api.post("/ivr/confirm")
-def ivr_confirm(body: IvrConfirm, conn=Depends(db)):
-    # Called by the IVR provider; the pilot verifies its signature.
+async def ivr_confirm(request: Request, conn=Depends(db)):
+    """Called by the IVR provider when the collector presses a key. Signed, because this is the only
+    consent a basic-phone collector gives. The dealer's on-stage button uses the demo route below."""
+    body: IvrConfirm = await provider_payload(request, IvrConfirm)
     return services.ivr_confirm(conn, **body.model_dump())
 
 
@@ -444,10 +533,11 @@ def recycler_sale(body: RecyclerSaleBody, me_id: int = Depends(require_dealer), 
 
 
 # ---------- Satin ----------
-# Not behind a login yet: the Satin dashboard shows seeded demo data only. See README.
+# Every route here needs a Satin branch-staff session (phone + PIN, see /auth/login with role=satin):
+# together they read collectors' personal data, review fraud flags and disburse money.
 
 @api.get("/flags")
-def list_flags(status: str | None = None, conn=Depends(db)):
+def list_flags(status: str | None = None, _satin: int = Depends(require_satin), conn=Depends(db)):
     q = ("SELECT f.*, c.name AS collector_name, d.shop_name FROM fraud_flags f "
          "LEFT JOIN collectors c ON c.id = f.collector_id LEFT JOIN dealers d ON d.id = f.dealer_id ")
     args = ()
@@ -466,7 +556,7 @@ class FlagUpdate(BaseModel):
 
 
 @api.post("/flags/{flag_id}")
-def update_flag(flag_id: int, body: FlagUpdate, conn=Depends(db)):
+def update_flag(flag_id: int, body: FlagUpdate, _satin: int = Depends(require_satin), conn=Depends(db)):
     f = one(conn.execute("SELECT * FROM fraud_flags WHERE id = ?", (flag_id,)))
     if not f:
         raise ApiError(404, "Flag not found")
@@ -479,17 +569,21 @@ def update_flag(flag_id: int, body: FlagUpdate, conn=Depends(db)):
 
 
 @api.post("/scores/recompute")
-def recompute_scores(conn=Depends(db)):
+def recompute_scores(_satin: int = Depends(require_satin), conn=Depends(db)):
     return {"recomputed": score.recompute_all(conn)}
 
 
+class LoanBody(BaseModel):
+    collector_id: int
+
+
 @api.post("/loans", status_code=201)
-def create_loan(body: dict, conn=Depends(db)):
-    return services.disburse_starter_loan(conn, int(body["collector_id"]))
+def create_loan(body: LoanBody, _satin: int = Depends(require_satin), conn=Depends(db)):
+    return services.disburse_starter_loan(conn, body.collector_id)
 
 
 @api.get("/groups")
-def list_groups(conn=Depends(db)):
+def list_groups(_satin: int = Depends(require_satin), conn=Depends(db)):
     groups = rows(conn.execute("SELECT * FROM groups ORDER BY id"))
     for g in groups:
         g["members"] = rows(conn.execute(
@@ -520,7 +614,7 @@ def _weekly(conn, col: str | None, val, field: str, weeks: int = 8) -> list[dict
 
 
 @api.get("/satin/overview")
-def satin_overview(conn=Depends(db)):
+def satin_overview(_satin: int = Depends(require_satin), conn=Depends(db)):
     month_ago = clock.ago(days=30)
     active = conn.execute(
         "SELECT COUNT(*) FROM (SELECT collector_id FROM transactions WHERE created_at >= ? "
@@ -559,7 +653,7 @@ def _collector_ref(collector_id: int) -> str:
 
 
 @api.get("/batches/{code}")
-def batch_trace(code: str, conn=Depends(db)):
+def batch_trace(code: str, _satin: int = Depends(require_satin), conn=Depends(db)):
     """Pseudonymised trace for recyclers/brands: no names or phone numbers."""
     b = one(conn.execute("SELECT b.*, d.shop_name FROM batches b JOIN dealers d ON d.id = b.dealer_id "
                          "WHERE b.code = ?", (code,)))
@@ -573,15 +667,51 @@ def batch_trace(code: str, conn=Depends(db)):
     return {"batch": b, "sales": txs, "recycler_sale": sale}
 
 
+# ---------- Demo-only routes ----------
+# These exist so the recording can be driven from the stage. They are off by default: reset needs
+# WW_ALLOW_RESET=1 plus the X-Demo-Key secret, and the rest 404 unless WW_DEMO_MODE=1.
+
 @api.post("/demo/reset")
-def demo_reset():
-    if os.environ.get("WW_ALLOW_RESET", "1") != "1":
-        raise ApiError(403, "Reset disabled")
+def demo_reset(request: Request):
+    """Wipes and reseeds everything, so it is locked behind both a switch and a shared secret."""
+    if not auth.demo_reset_allowed():
+        raise ApiError(403, "Reset is disabled. Set WW_ALLOW_RESET=1 to allow it.")
+    if not auth.demo_key_ok(request.headers.get("x-demo-key")):
+        raise ApiError(403, "Missing or wrong X-Demo-Key")
     from .seed import seed
     with _lock, _setup_lock():
         _db.ensure_alive()
         seed(_db, wipe=True)
     return {"ok": True}
+
+
+class SimulateScanBody(BaseModel):
+    lat: float
+    lng: float
+
+
+@api.post("/demo/requests/{request_id}/simulate-scan", dependencies=[Depends(require_demo_mode)])
+def demo_simulate_scan(request_id: int, body: SimulateScanBody,
+                       me_id: int = Depends(require_dealer), conn=Depends(db)):
+    """Stands in for pointing the camera at the collector's QR card. The token stays on the server:
+    dealers are never told a collector's QR token, so the scan has to be simulated here."""
+    req = services.get_request(conn, request_id)
+    c = one(conn.execute("SELECT qr_token FROM collectors WHERE id = ?", (req["collector_id"],)))
+    if not c:
+        raise ApiError(404, "Collector not found")
+    return services.accept_request(conn, request_id, dealer_id=me_id, qr_token=c["qr_token"],
+                                   lat=body.lat, lng=body.lng)
+
+
+@api.post("/demo/requests/{request_id}/ivr-confirm", dependencies=[Depends(require_demo_mode)])
+def demo_ivr_confirm(request_id: int, me_id: int = Depends(require_dealer), conn=Depends(db)):
+    """The dealer's "collector presses 1" button. The real /ivr/confirm needs the provider's
+    signature and the collector's caller ID; this looks the phone number up instead."""
+    req = services.get_request(conn, request_id)
+    if req["dealer_id"] != me_id:
+        raise ApiError(403, "This request was started by another dealer")
+    c = one(conn.execute("SELECT phone FROM collectors WHERE id = ?", (req["collector_id"],)))
+    return services.ivr_confirm(conn, request_id=request_id, caller_phone=c["phone"], digit="1")
 
 
 app.include_router(api)
