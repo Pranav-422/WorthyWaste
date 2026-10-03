@@ -12,6 +12,7 @@
       "functions": {
         "app/main.py": {
           "maxDuration": 60,
+          "regions": ["sin1"],
           "excludeFiles": "{tests/**,data/**,requirements-dev.txt}"
         }
       }
