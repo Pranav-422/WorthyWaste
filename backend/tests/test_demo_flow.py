@@ -1,59 +1,10 @@
-"""Runs the Design Doc's demo click path end to end against a fresh database."""
-import io
-import os
-import random
-import tempfile
+"""Runs the Design Doc's demo click path end to end against a fresh database.
+
+Environment, fixtures and helpers come from conftest.py.
+"""
 import time
 
-import pytest
-
-os.environ["WW_SCRIPTED"] = "1"
-os.environ["WW_DATA_DIR"] = tempfile.mkdtemp(prefix="ww-test-")
-os.environ.pop("WW_DB", None)
-
-from fastapi.testclient import TestClient  # noqa: E402
-from PIL import Image  # noqa: E402
-
-from app.main import app  # noqa: E402
-
-RAJU = (28.67312, 77.28654)
-
-
-def photo(seed: int) -> bytes:
-    rng = random.Random(seed)
-    img = Image.new("RGB", (64, 64))
-    img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(64 * 64)])
-    buf = io.BytesIO()
-    img.save(buf, "JPEG")
-    return buf.getvalue()
-
-
-@pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:
-        c.post("/api/demo/reset")
-        login(c, "dealer", "9811000001")  # Raju Kabadi Store
-        yield c
-
-
-def ids(client):
-    collectors = {c["name"].split()[0]: c for c in client.get("/api/collectors").json()}
-    dealers = {d["shop_name"].split()[0]: d for d in client.get("/api/dealers").json()}
-    return collectors, dealers
-
-
-def login(client, role, phone, pin="1234"):
-    r = client.post("/api/auth/login", json={"role": role, "phone": phone, "pin": pin})
-    assert r.status_code == 200, r.text
-    return r.json()["user"]
-
-
-def new_request(client, cid, img, kg=28, loc=RAJU):
-    """Logs in as that collector (their own session), then raises a sale request."""
-    phone = next(c["phone"] for c in client.get("/api/collectors").json() if c["id"] == cid)
-    login(client, "collector", phone)
-    return client.post("/api/requests", data={"material": "plastic", "est_kg": kg, "lat": loc[0], "lng": loc[1]},
-                       files={"photo": ("p.jpg", img, "image/jpeg")})
+from tests.conftest import RAJU, ids, login, new_request, photo, signed
 
 
 def test_seeded_frauds_present(client):
@@ -87,8 +38,9 @@ def test_demo_click_path(client):
     assert not w["gap_warning"]
     assert w["amount"] == 340
 
-    # 4. Approve and pay → mock webhook creates the transaction.
-    a = client.post(f"/api/requests/{req['id']}/approve", json={"dealer_id": raju["id"]})
+    # 4. Dealer confirms the material (pre-selected: the collector's choice) and pays.
+    a = client.post(f"/api/requests/{req['id']}/approve",
+                    json={"dealer_id": raju["id"], "material": "plastic"})
     assert a.status_code == 200, a.text
     for _ in range(30):
         got = client.get(f"/api/requests/{req['id']}").json()
@@ -96,7 +48,7 @@ def test_demo_click_path(client):
             break
         time.sleep(0.1)
     tx = got["transaction"]
-    assert tx and tx["amount"] == 340 and tx["scale_kg"] == 27.4
+    assert tx and tx["amount"] == 340 and tx["scale_kg"] == 27.4 and tx["material"] == "plastic"
 
     # 5. Collector sees ₹340 · 27.4 kg and a message.
     prof = client.get(f"/api/collectors/{meena['id']}").json()
@@ -159,9 +111,11 @@ def test_ivr_path(client):
     r = client.post("/api/ivr/start", json={"dealer_id": dealers["Raju"]["id"], "qr_token": s["qr_token"],
                                         "material": "paper", "est_kg": 12}).json()
     rid = r["request"]["id"]
-    bad = client.post("/api/ivr/confirm", json={"request_id": rid, "caller_phone": "9999999999", "digit": "1"})
+    bad = signed(client, "/api/ivr/confirm",
+                 {"request_id": rid, "caller_phone": "9999999999", "digit": "1"})
     assert bad.status_code == 403
-    ok = client.post("/api/ivr/confirm", json={"request_id": rid, "caller_phone": s["phone"], "digit": "1"})
+    ok = signed(client, "/api/ivr/confirm",
+                {"request_id": rid, "caller_phone": s["phone"], "digit": "1"})
     assert ok.json()["status"] == "accepted"
 
 
