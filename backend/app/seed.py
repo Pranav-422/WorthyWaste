@@ -48,6 +48,18 @@ SATIN_USERS = [
 ]
 
 
+def ensure_satin_users(conn: Database) -> None:
+    """Databases seeded before the Satin login existed have no branch staff, so add the sample
+    account. Never touches a database that already has any."""
+    if conn.execute("SELECT COUNT(*) FROM satin_users").fetchone()[0]:
+        return
+    with transaction(conn):
+        for name, phone, branch in SATIN_USERS:
+            conn.execute(
+                "INSERT INTO satin_users (name, phone, pin_hash, branch, created_at) VALUES (?,?,?,?,?)",
+                (name, phone, auth.hash_pin(DEMO_PIN), branch, clock.ts()))
+
+
 def _wipe(conn):
     for t in reversed(TABLES):
         if t != "materials":

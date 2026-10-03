@@ -11,11 +11,12 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from . import adapters, auth, clock, fraud, score, services
-from .db import connect, init_db, one, rows, transaction
+from .db import DATABASE_URL, connect, init_db, one, rows, transaction
 from .services import ApiError
 
 _db = connect()
@@ -53,23 +54,51 @@ def db():
 
 @contextmanager
 def _setup_lock():
-    """Serialise schema creation and seeding when several cold starts race on one Postgres."""
-    if _db.is_pg:
-        _db.execute("SELECT pg_advisory_lock(?)", (_ADVISORY_KEY,))
-    try:
+    """Serialise schema creation and seeding when several cold starts race on one Postgres.
+
+    The lock is taken on its own direct connection. DATABASE_URL is usually a pooled URL (PgBouncer in
+    transaction mode, as on Neon), where pg_advisory_lock and pg_advisory_unlock can run on different
+    server sessions: the unlock misses, the lock stays held, and every later cold start waits on it
+    until the function times out. A dedicated connection releases the lock for certain when it closes,
+    and the wait is bounded so a stuck holder can never hang a request."""
+    if not _db.is_pg:
         yield
-    finally:
-        if _db.is_pg:
-            _db.execute("SELECT pg_advisory_unlock(?)", (_ADVISORY_KEY,))
+        return
+    import psycopg
+
+    url = (os.environ.get("DATABASE_URL_UNPOOLED") or os.environ.get("POSTGRES_URL_NON_POOLING")
+           or DATABASE_URL)
+    with psycopg.connect(url, autocommit=True, connect_timeout=15) as lock_conn:
+        lock_conn.execute("SET lock_timeout = '30s'")
+        try:
+            lock_conn.execute("SELECT pg_advisory_lock(%s)", (_ADVISORY_KEY,))
+        except psycopg.errors.LockNotAvailable:
+            raise SetupBusy()
+        try:
+            yield
+        finally:
+            lock_conn.execute("SELECT pg_advisory_unlock(%s)", (_ADVISORY_KEY,))
+
+
+class SetupBusy(Exception):
+    """Another instance is creating the schema or seeding right now."""
 
 
 def startup():
-    with _lock, _setup_lock():
-        _db.ensure_alive()
-        init_db(_db)
-        if _db.execute("SELECT COUNT(*) FROM collectors").fetchone()[0] == 0:
-            from .seed import seed
-            seed(_db)
+    from .seed import ensure_satin_users, seed
+
+    try:
+        with _lock, _setup_lock():
+            _db.ensure_alive()
+            init_db(_db)
+            if _db.execute("SELECT COUNT(*) FROM collectors").fetchone()[0] == 0:
+                seed(_db)
+            else:
+                # Databases created before the Satin login existed have no branch staff to log in as.
+                ensure_satin_users(_db)
+    except SetupBusy:
+        # Another cold start holds the setup lock and will finish the schema and seed itself.
+        pass
 
 
 @asynccontextmanager
@@ -394,11 +423,15 @@ async def create_request(
     data = await photo.read()
     if len(data) > 4_000_000:
         raise ApiError(413, "Photo too large")
+    # The photo check calls an external model and can take seconds. Run it before taking the
+    # instance lock and opening a transaction, and off the event loop, so a slow model never stalls
+    # other requests or holds a database connection open.
+    clean, ai = await run_in_threadpool(services.check_photo, material, data, demo_ai_material)
     with _tx() as conn:
         return services.create_request(conn, collector_id=me_id, material_code=material,
                                        est_kg=est_kg, lat=lat, lng=lng, photo=data,
                                        confirm_mismatch=confirm_mismatch,
-                                       demo_ai_material=demo_ai_material)
+                                       demo_ai_material=demo_ai_material, checked=(clean, ai))
 
 
 def _may_see_request(request: Request, req: dict) -> bool:
@@ -679,9 +712,12 @@ def demo_reset(request: Request):
     if not auth.demo_key_ok(request.headers.get("x-demo-key")):
         raise ApiError(403, "Missing or wrong X-Demo-Key")
     from .seed import seed
-    with _lock, _setup_lock():
-        _db.ensure_alive()
-        seed(_db, wipe=True)
+    try:
+        with _lock, _setup_lock():
+            _db.ensure_alive()
+            seed(_db, wipe=True)
+    except SetupBusy:
+        raise ApiError(503, "Another reset or setup is running. Try again in a minute.")
     return {"ok": True}
 
 

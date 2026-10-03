@@ -62,9 +62,32 @@ def verify_photo(selected_material: str, jpeg: bytes) -> dict:
     return fraud.photo_verdict(selected_material, check)
 
 
+def check_photo(material_code: str, photo: bytes, demo_ai_material: str | None = None) -> tuple[bytes, dict]:
+    """Re-encode the photo and run the photo check. Needs no database, so the API runs it before taking
+    a connection: the verifier is a network call that can take seconds.
+
+    Re-encoding comes first because Pillow writes pixels only, so EXIF (including the GPS tags phones
+    embed) is gone, both from what we send the verifier and from what we store."""
+    try:
+        clean = adapters.reencode_jpeg(photo)
+    except Exception:
+        raise ApiError(400, "Photo could not be read")
+    if demo_ai_material and auth.demo_mode():
+        # Demo only: script what the photo check "saw", so the mismatch warning can be shown on stage
+        # without hunting for a photo the real model gets wrong.
+        ai = fraud.photo_verdict(material_code, adapters.PhotoCheck(
+            available=True, material=demo_ai_material, confidence=0.87, real_scene=True,
+            approx_quantity="one full sack", notes="Scripted demo photo check"))
+    else:
+        ai = verify_photo(material_code, clean)
+    return clean, ai
+
+
 def create_request(conn, *, collector_id: int, material_code: str, est_kg: float,
                    lat: float | None, lng: float | None, photo: bytes,
-                   confirm_mismatch: bool = False, demo_ai_material: str | None = None) -> dict:
+                   confirm_mismatch: bool = False, demo_ai_material: str | None = None,
+                   checked: tuple[bytes, dict] | None = None) -> dict:
+    """`checked` is check_photo()'s result when the caller already ran it outside the transaction."""
     c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (collector_id,)))
     if not c:
         raise ApiError(404, "Collector not found")
@@ -87,20 +110,7 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
         )
         raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
 
-    # Re-encode before the photo goes anywhere: Pillow writes pixels only, so EXIF (including the GPS
-    # tags phones embed) is gone, both from what we send the verifier and from what we store.
-    try:
-        clean = adapters.reencode_jpeg(photo)
-    except Exception:
-        raise ApiError(400, "Photo could not be read")
-    if demo_ai_material and auth.demo_mode():
-        # Demo only: script what the photo check "saw", so the mismatch warning can be shown on stage
-        # without hunting for a photo the real model gets wrong.
-        ai = fraud.photo_verdict(material_code, adapters.PhotoCheck(
-            available=True, material=demo_ai_material, confidence=0.87, real_scene=True,
-            approx_quantity="one full sack", notes="Scripted demo photo check"))
-    else:
-        ai = verify_photo(material_code, clean)
+    clean, ai = checked or check_photo(material_code, photo, demo_ai_material)
 
     if ai["verdict"] == "mismatch" and not confirm_mismatch:
         # Warn once, don't refuse: the collector can fix the material or send it anyway.
