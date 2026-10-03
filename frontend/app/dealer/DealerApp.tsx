@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, get, logout, post } from "@/lib/api";
 import { kg, rupees, shortTime, timeAgo } from "@/lib/format";
-import { getLocation } from "@/lib/location";
-import type { Batch, Collector, Dealer, Material, MassBalance, SaleRequest, Transaction } from "@/lib/types";
+import { getLocation, LocationError } from "@/lib/location";
+import type { Batch, Dealer, Material, MassBalance, SaleRequest, Transaction } from "@/lib/types";
 import { QrScanner } from "@/components/QrScanner";
 import { CheckIcon, Logo, MaterialIcon, QrIcon, ScaleIcon, StopIcon } from "@/components/icons";
 
@@ -18,6 +18,8 @@ type Step =
   | { kind: "ivr" };
 
 type WeighResult = {
+  /** The collector's choice, which the dealer confirms or corrects before paying. */
+  material: string;
   scale_kg: number;
   scale_source: string;
   rate_per_kg: number;
@@ -26,6 +28,42 @@ type WeighResult = {
   gap_warning: boolean;
   flags: number[];
 };
+
+/** What the backend's pay_amount does, so the button shows what will actually be paid. */
+const payAmount = (scaleKg: number, ratePerKg: number) => Math.round(scaleKg * ratePerKg);
+
+// ---------- Photo check badge ----------
+
+/**
+ * What the photo check made of the collector's photo, in one line the dealer can read at a glance.
+ * "unchecked" shows nothing: the dealer has the scrap in front of them, and a missing AI answer is
+ * not information about the load.
+ */
+function AiBadge({ req, materials, className = "" }: { req: SaleRequest; materials: Material[]; className?: string }) {
+  const verdict = req.ai_verdict;
+  if (!verdict || verdict === "unchecked") return null;
+  const label = materials.find((m) => m.code === req.ai_material)?.label_en.toLowerCase() ?? req.ai_material;
+  const pct = req.ai_confidence == null ? null : `${Math.round(req.ai_confidence * 100)}%`;
+  const tone =
+    verdict === "mismatch"
+      ? "bg-brick-soft text-brick"
+      : verdict === "uncertain"
+        ? "bg-marigold-soft text-ink"
+        : "bg-leaf-soft text-leaf-dark";
+  const text =
+    req.ai_real_scene === 0
+      ? "AI: looks like a photo of a screen"
+      : verdict === "mismatch"
+        ? req.ai_material === "not_scrap"
+          ? "AI: does not look like scrap"
+          : `AI: looks like ${label}${pct ? ` (${pct})` : ""}`
+        : verdict === "uncertain"
+          ? `AI: not sure${label && req.ai_material !== "mixed" ? ` — maybe ${label}` : ", looks mixed"}`
+          : `AI: matches ${label}${pct ? ` (${pct})` : ""}`;
+  return (
+    <span className={`inline-block rounded-lg px-2 py-0.5 text-xs font-semibold ${tone} ${className}`}>{text}</span>
+  );
+}
 
 type DealerProfile = {
   dealer: Dealer;
@@ -42,8 +80,13 @@ export function DealerApp({ dealerId, demo }: { dealerId: number; demo: boolean 
   const [tab, setTab] = useState<Tab>("queue");
   const [step, setStep] = useState<Step | null>(null);
   const [locMode, setLocMode] = useState<"demo" | "far" | "gps">(demo ? "demo" : "gps");
+  const [materials, setMaterials] = useState<Material[]>([]);
 
   const loadProfile = useCallback(() => get<DealerProfile>(`/dealers/${dealerId}`).then(setProfile), [dealerId]);
+
+  useEffect(() => {
+    get<Material[]>("/materials").then(setMaterials);
+  }, []);
 
   useEffect(() => {
     loadProfile();
@@ -89,11 +132,18 @@ export function DealerApp({ dealerId, demo }: { dealerId: number; demo: boolean 
         </header>
 
         {step ? (
-          <Flow step={step} setStep={setStep} dealer={d} locMode={locMode} demo={demo} onClose={close} />
+          <Flow step={step} setStep={setStep} dealer={d} locMode={locMode} demo={demo} materials={materials} onClose={close} />
         ) : (
           <>
             <main className="flex-1 px-4 py-4">
-              {tab === "queue" && <Queue queue={queue} onPick={(req) => resume(req, setStep)} onIvr={() => setStep({ kind: "ivr" })} />}
+              {tab === "queue" && (
+                <Queue
+                  queue={queue}
+                  materials={materials}
+                  onPick={(req) => resume(req, setStep)}
+                  onIvr={() => setStep({ kind: "ivr" })}
+                />
+              )}
               {tab === "today" && <Today profile={profile} />}
               {tab === "sell" && <Sell profile={profile} onDone={loadProfile} />}
             </main>
@@ -129,7 +179,17 @@ function resume(req: SaleRequest, setStep: (s: Step) => void) {
 
 // ---------- Queue ----------
 
-function Queue({ queue, onPick, onIvr }: { queue: SaleRequest[]; onPick: (r: SaleRequest) => void; onIvr: () => void }) {
+function Queue({
+  queue,
+  materials,
+  onPick,
+  onIvr,
+}: {
+  queue: SaleRequest[];
+  materials: Material[];
+  onPick: (r: SaleRequest) => void;
+  onIvr: () => void;
+}) {
   return (
     <div className="space-y-3">
       {queue.length === 0 && (
@@ -159,6 +219,7 @@ function Queue({ queue, onPick, onIvr }: { queue: SaleRequest[]; onPick: (r: Sal
               {r.distance_m != null && ` · ${r.distance_m} m`}
               {r.channel === "ivr" && " · basic phone"}
             </p>
+            <AiBadge req={r} materials={materials} className="mt-1" />
           </div>
           <span
             className={`flex items-center gap-1 rounded-xl px-3 py-2 text-sm font-semibold ${
@@ -190,6 +251,7 @@ function Flow({
   dealer,
   locMode,
   demo,
+  materials,
   onClose,
 }: {
   step: Step;
@@ -197,6 +259,7 @@ function Flow({
   dealer: Dealer;
   locMode: "demo" | "far" | "gps";
   demo: boolean;
+  materials: Material[];
   onClose: () => void;
 }) {
   const [error, setError] = useState<string | null>(null);
@@ -208,7 +271,13 @@ function Flow({
     try {
       await fn();
     } catch (e) {
-      setError((e as ApiError).message);
+      setError(
+        e instanceof LocationError
+          ? e.reason === "denied"
+            ? "This phone's location is turned off. Allow it in settings — the sale needs to show you and the collector are together."
+            : "Could not read this phone's location. Step into the open and try again."
+          : (e as ApiError).message,
+      );
     } finally {
       setBusy(false);
     }
@@ -230,12 +299,25 @@ function Flow({
           req={step.req}
           busy={busy}
           demo={demo}
+          materials={materials}
           onToken={(token) =>
             run(async () => {
               const loc = await getLocation(locMode);
               const req = await post<SaleRequest>(`/requests/${step.req.id}/accept`, {
                 dealer_id: dealer.id,
                 qr_token: token,
+                lat: loc.lat,
+                lng: loc.lng,
+              });
+              setStep({ kind: "weigh", req: { ...step.req, ...req }, distance: req.gps_distance_m });
+            })
+          }
+          onSimulate={() =>
+            run(async () => {
+              // The server holds the collector's QR token — dealers are never told it — so the
+              // simulated scan has to be accepted there. 404s unless WW_DEMO_MODE=1.
+              const loc = await getLocation(locMode);
+              const req = await post<SaleRequest>(`/demo/requests/${step.req.id}/simulate-scan`, {
                 lat: loc.lat,
                 lng: loc.lng,
               });
@@ -250,6 +332,7 @@ function Flow({
           distance={step.distance}
           busy={busy}
           demo={demo}
+          materials={materials}
           onWeigh={(mode) =>
             run(async () => {
               const w = await post<WeighResult & { request: SaleRequest }>(`/requests/${step.req.id}/weigh`, { dealer_id: dealer.id, mode });
@@ -263,23 +346,46 @@ function Flow({
           req={step.req}
           w={step.weigh}
           busy={busy}
+          materials={materials}
           onReweigh={() => setStep({ kind: "weigh", req: step.req, distance: step.req.gps_distance_m })}
-          onPay={() =>
+          onPay={(confirmed, amount) =>
             run(async () => {
-              await post(`/requests/${step.req.id}/approve`, { dealer_id: dealer.id });
-              setStep({ kind: "paying", req: step.req, amount: step.weigh.amount });
+              await post(`/requests/${step.req.id}/approve`, { dealer_id: dealer.id, material: confirmed });
+              setStep({ kind: "paying", req: step.req, amount });
             })
           }
         />
       )}
       {step.kind === "paying" && <Paying req={step.req} amount={step.amount} onPaid={(tx) => setStep({ kind: "paid", tx, name: step.req.collector_name ?? "" })} />}
       {step.kind === "paid" && <Paid tx={step.tx} name={step.name} onClose={onClose} />}
-      {step.kind === "ivr" && <IvrStep dealer={dealer} busy={busy} run={run} onAccepted={(req) => setStep({ kind: "weigh", req, distance: 0 })} />}
+      {step.kind === "ivr" && (
+        <IvrStep
+          dealer={dealer}
+          busy={busy}
+          demo={demo}
+          run={run}
+          onAccepted={(req) => setStep({ kind: "weigh", req, distance: 0 })}
+        />
+      )}
     </main>
   );
 }
 
-function ScanStep({ req, busy, demo, onToken }: { req: SaleRequest; busy: boolean; demo: boolean; onToken: (t: string) => void }) {
+function ScanStep({
+  req,
+  busy,
+  demo,
+  materials,
+  onToken,
+  onSimulate,
+}: {
+  req: SaleRequest;
+  busy: boolean;
+  demo: boolean;
+  materials: Material[];
+  onToken: (t: string) => void;
+  onSimulate: () => void;
+}) {
   const [manual, setManual] = useState("");
   const [scanning, setScanning] = useState(true);
   const handled = useRef(false);
@@ -293,11 +399,6 @@ function ScanStep({ req, busy, demo, onToken }: { req: SaleRequest; busy: boolea
     [onToken],
   );
 
-  async function simulate() {
-    const c = await get<{ collector: Collector }>(`/collectors/${req.collector_id}`);
-    onResult(c.collector.qr_token);
-  }
-
   return (
     <>
       <div className="flex items-center gap-3">
@@ -307,6 +408,7 @@ function ScanStep({ req, busy, demo, onToken }: { req: SaleRequest; busy: boolea
           <p className="text-sm text-slate">
             {req.label_en} · ~{kg(req.est_kg)}
           </p>
+          <AiBadge req={req} materials={materials} className="mt-1" />
         </div>
       </div>
       <p className="text-center font-semibold">Scan the collector&apos;s QR card</p>
@@ -332,9 +434,9 @@ function ScanStep({ req, busy, demo, onToken }: { req: SaleRequest; busy: boolea
       {demo && (
         <button
           onClick={() => {
-            handled.current = false;
+            handled.current = true;
             setScanning(false);
-            simulate();
+            onSimulate();
           }}
           className="text-xs text-slate underline"
         >
@@ -350,12 +452,14 @@ function WeighStep({
   distance,
   busy,
   demo,
+  materials,
   onWeigh,
 }: {
   req: SaleRequest;
   distance: number | null;
   busy: boolean;
   demo: boolean;
+  materials: Material[];
   onWeigh: (mode: "normal" | "overstated") => void;
 }) {
   return (
@@ -371,6 +475,19 @@ function WeighStep({
         <p className="font-display text-7xl font-bold tabular opacity-40">--.-</p>
         <p className="mt-2 text-sm opacity-70">Estimate {kg(req.est_kg)}</p>
       </div>
+      {req.photo_url && (
+        <div className="flex items-start gap-3 rounded-2xl border border-line bg-white p-3">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={req.photo_url} alt="The collector's photo of this load" className="h-20 w-20 rounded-xl object-cover" />
+          <div className="min-w-0">
+            <p className="text-sm">
+              Collector chose <b>{req.label_en ?? req.material}</b>
+            </p>
+            <AiBadge req={req} materials={materials} className="mt-1" />
+            {req.ai_notes && <p className="mt-1 text-xs text-slate">{req.ai_notes}</p>}
+          </div>
+        </div>
+      )}
       <button
         onClick={() => onWeigh("normal")}
         disabled={busy}
@@ -405,9 +522,29 @@ function useCountUp(target: number, ms = 900) {
   return v;
 }
 
-function PayStep({ req, w, busy, onPay, onReweigh }: { req: SaleRequest; w: WeighResult; busy: boolean; onPay: () => void; onReweigh: () => void }) {
+function PayStep({
+  req,
+  w,
+  busy,
+  materials,
+  onPay,
+  onReweigh,
+}: {
+  req: SaleRequest;
+  w: WeighResult;
+  busy: boolean;
+  materials: Material[];
+  onPay: (material: string, amount: number) => void;
+  onReweigh: () => void;
+}) {
   const shown = useCountUp(w.scale_kg);
   const settled = Math.abs(shown - w.scale_kg) < 0.05;
+  // Pre-selected: the collector's choice. The dealer has the scrap in their hands, so theirs is the
+  // answer that sets the rate, the money and the batch — one tap to confirm, one to correct.
+  const [confirmed, setConfirmed] = useState(w.material);
+  const rate = materials.find((m) => m.code === confirmed)?.rate_per_kg ?? w.rate_per_kg;
+  const amount = payAmount(w.scale_kg, rate);
+  const changed = confirmed !== w.material;
   return (
     <>
       <div className={`rounded-3xl p-6 text-center text-white ${w.gap_warning ? "bg-brick" : "bg-ink"}`}>
@@ -430,15 +567,43 @@ function PayStep({ req, w, busy, onPay, onReweigh }: { req: SaleRequest; w: Weig
           <CheckIcon className="h-5 w-5" /> Within 10% of estimate
         </p>
       )}
+      <section>
+        <p className="mb-2 text-sm font-semibold">
+          Confirm what you are buying
+          <span className="font-normal text-slate"> · collector chose {req.label_en ?? w.material}</span>
+        </p>
+        <div className="grid grid-cols-3 gap-2">
+          {materials.map((m) => (
+            <button
+              key={m.code}
+              onClick={() => setConfirmed(m.code)}
+              aria-pressed={confirmed === m.code}
+              className={`flex min-h-20 flex-col items-center justify-center gap-1 rounded-xl border-2 p-1 text-center text-xs font-semibold ${
+                confirmed === m.code ? "border-leaf bg-leaf-soft text-leaf-dark" : "border-line bg-white text-ink"
+              }`}
+            >
+              <MaterialIcon code={m.code} className="h-7 w-7" />
+              {m.label_en}
+              <span className="font-normal text-slate">₹{m.rate_per_kg}/kg</span>
+            </button>
+          ))}
+        </div>
+        {changed && (
+          <p className="mt-2 rounded-xl bg-marigold-soft p-2 text-xs font-semibold text-ink">
+            You are buying this as {materials.find((m) => m.code === confirmed)?.label_en}, not the{" "}
+            {req.label_en ?? w.material} the collector chose. Satin sees the difference.
+          </p>
+        )}
+      </section>
       <p className="text-center text-slate tabular">
-        {kg(w.scale_kg)} × ₹{w.rate_per_kg}/kg
+        {kg(w.scale_kg)} × ₹{rate}/kg
       </p>
       <button
-        onClick={onPay}
+        onClick={() => onPay(confirmed, amount)}
         disabled={busy || !settled}
         className="h-18 rounded-2xl bg-leaf text-2xl font-bold text-white shadow-[0_4px_0_#155c39] disabled:opacity-50"
       >
-        Approve and pay {rupees(w.amount)}
+        Approve and pay {rupees(amount)}
       </button>
       <button onClick={onReweigh} className="text-sm text-slate underline">
         Weigh again
@@ -508,11 +673,13 @@ function Paid({ tx, name, onClose }: { tx: Transaction; name: string; onClose: (
 function IvrStep({
   dealer,
   busy,
+  demo,
   run,
   onAccepted,
 }: {
   dealer: Dealer;
   busy: boolean;
+  demo: boolean;
   run: (fn: () => Promise<void>) => Promise<void>;
   onAccepted: (req: SaleRequest) => void;
 }) {
@@ -534,18 +701,27 @@ function IvrStep({
           <p className="mt-2 text-lg">“{call.ivr_prompt}”</p>
         </div>
         <p className="text-center text-sm text-slate">Waiting for the collector to press 1 on their phone…</p>
-        <button
-          disabled={busy}
-          onClick={() =>
-            run(async () => {
-              const req = await post<SaleRequest>("/ivr/confirm", { request_id: call.request.id, caller_phone: call.calling, digit: "1" });
-              onAccepted({ ...call.request, ...req });
-            })
-          }
-          className="h-14 w-full rounded-2xl border-2 border-dashed border-slate font-semibold text-slate"
-        >
-          Demo: collector presses 1
-        </button>
+        {!demo && (
+          <p className="text-center text-xs text-slate">
+            The IVR provider confirms the keypress itself; this screen updates when it does.
+          </p>
+        )}
+        {demo && (
+          <button
+            disabled={busy}
+            onClick={() =>
+              run(async () => {
+                // The real /ivr/confirm needs the provider's signature and the collector's caller
+                // ID. This stands in for the keypress; it 404s unless WW_DEMO_MODE=1.
+                const req = await post<SaleRequest>(`/demo/requests/${call.request.id}/ivr-confirm`);
+                onAccepted({ ...call.request, ...req });
+              })
+            }
+            className="h-14 w-full rounded-2xl border-2 border-dashed border-slate font-semibold text-slate"
+          >
+            Demo: collector presses 1
+          </button>
+        )}
       </div>
     );
   }

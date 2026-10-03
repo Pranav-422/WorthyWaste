@@ -18,8 +18,9 @@ MIN_VERIFIED_SALES = 20
 LOAN_LADDER = [5000, 10000, 15000, 25000]
 # Open flags on these rules hold eligibility until Satin reviews them: each one is about a sale or
 # payment that actually went through. A duplicate photo is blocked before any money moves, so it is
-# shown to Satin but only freezes eligibility once confirmed.
-HOLDING_RULES = ("weight_gap", "volume_outlier", "circular_payment", "pair_frequency")
+# shown to Satin but only freezes eligibility once confirmed. photo_mismatch only reaches this list
+# as a pattern (3+ in 7 days) or when the dealer confirmed a different material — never on one AI guess.
+HOLDING_RULES = ("weight_gap", "volume_outlier", "circular_payment", "pair_frequency", "photo_mismatch")
 
 
 def _clip(x: float) -> float:

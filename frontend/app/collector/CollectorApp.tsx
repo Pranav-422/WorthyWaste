@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, get, logout, postForm } from "@/lib/api";
 import { kg, mmss, parseTs, rupees, shortDate } from "@/lib/format";
-import { t, voice, type Lang } from "@/lib/i18n";
-import { getLocation } from "@/lib/location";
+import { mismatchMaterials, mismatchVoice, t, voice, type Lang } from "@/lib/i18n";
+import { getLocation, LocationError } from "@/lib/location";
 import { speak, speakMessage } from "@/lib/speech";
-import type { CollectorProfile, Material, Message, SaleRequest, Transaction } from "@/lib/types";
+import type { CollectorProfile, Material, Message, PhotoMismatch, SaleRequest, Transaction } from "@/lib/types";
 import { LiveCamera } from "@/components/LiveCamera";
 import { QrCode } from "@/components/QrCode";
 import { ScoreMeter } from "@/components/ScoreMeter";
@@ -331,13 +331,31 @@ function NewSale({
   const [photo, setPhoto] = useState<{ blob: Blob; preview: string } | null>(null);
   const [camera, setCamera] = useState(false);
   const [sending, setSending] = useState(false);
-  const [error, setError] = useState<{ msg: string; rule?: string | null } | null>(null);
+  const [error, setError] = useState<{ msg: string; help?: string; rule?: string | null } | null>(null);
+  // The photo check disagreed. We hold the warning here rather than sending: the collector decides.
+  const [warn, setWarn] = useState<{ ai: PhotoMismatch; photo: { blob: Blob; preview: string } } | null>(null);
+  // Demo only: what the photo check should pretend to see, so the warning can be shown on stage.
+  const [demoAi, setDemoAi] = useState("");
 
-  async function send(p = photo) {
+  async function send(p = photo, { confirmMismatch = false } = {}) {
     if (!p) return;
     setSending(true);
     setError(null);
-    const loc = await getLocation(demo ? "demo" : "gps");
+    let loc;
+    try {
+      loc = await getLocation(demo ? "demo" : "gps");
+    } catch (e) {
+      // Without a location the dealer cannot be shown to be standing next to us, so say so plainly
+      // instead of sending a sale that will be refused at the scale for a reason nobody explains.
+      const timedOut = e instanceof LocationError && e.reason === "timeout";
+      setError({
+        msg: t(lang, timedOut ? "locationTimeout" : "locationDenied"),
+        help: t(lang, timedOut ? "locationTimeoutHelp" : "locationDeniedHelp"),
+        rule: "location_missing",
+      });
+      setSending(false);
+      return;
+    }
     const f = new FormData();
     f.set("collector_id", String(collectorId));
     f.set("material", material);
@@ -345,18 +363,43 @@ function NewSale({
     f.set("lat", String(loc.lat));
     f.set("lng", String(loc.lng));
     f.set("photo", p.blob, "scrap.jpg");
+    if (confirmMismatch) f.set("confirm_mismatch", "1");
+    if (demo && demoAi) f.set("demo_ai_material", demoAi);
     try {
       const r = await postForm<SaleRequest>("/requests", f);
       lastPhoto = p;
+      setWarn(null);
       onSent(r);
     } catch (e) {
       const err = e as ApiError;
+      if (err.rule === "photo_mismatch") {
+        const ai = err.evidence as unknown as PhotoMismatch;
+        setWarn({ ai, photo: p });
+        speak(mismatchVoice(lang, ai.material), lang);
+        setSending(false);
+        return;
+      }
       const msg = err.rule === "duplicate_photo" ? t(lang, "dupPhoto") : err.message;
-      setError({ msg, rule: err.rule });
+      setError({ msg, help: err.rule === "duplicate_photo" ? t(lang, "dupPhotoHelp") : undefined, rule: err.rule });
       if (err.rule === "duplicate_photo") speak(t(lang, "dupPhoto") + (lang === "hi" ? "। " : ". ") + t(lang, "dupPhotoHelp"), lang);
     } finally {
       setSending(false);
     }
+  }
+
+  if (warn) {
+    return (
+      <PhotoWarning
+        ai={warn.ai}
+        lang={lang}
+        sending={sending}
+        onChange={() => {
+          setWarn(null);
+          setPhoto(warn.photo);
+        }}
+        onSendAnyway={() => send(warn.photo, { confirmMismatch: true })}
+      />
+    );
   }
 
   return (
@@ -366,7 +409,7 @@ function NewSale({
           <StopIcon className="h-7 w-7 shrink-0" />
           <div>
             <p className="text-lg font-semibold">{error.msg}</p>
-            {error.rule === "duplicate_photo" && <p className="text-sm opacity-90">{t(lang, "dupPhotoHelp")}</p>}
+            {error.help && <p className="text-sm opacity-90">{error.help}</p>}
           </div>
         </div>
       )}
@@ -439,10 +482,31 @@ function NewSale({
             📷 {t(lang, "takePhoto")}
           </button>
         )}
-        {demo && lastPhoto && !photo && (
-          <button onClick={() => send(lastPhoto!)} className="mt-2 w-full text-center text-xs text-slate underline">
-            Demo: resend the previous photo
-          </button>
+        {demo && (
+          <div className="mt-2 space-y-2">
+            {lastPhoto && !photo && (
+              <button onClick={() => send(lastPhoto!)} className="w-full text-center text-xs text-slate underline">
+                Demo: resend the previous photo
+              </button>
+            )}
+            <label className="flex items-center justify-center gap-2 text-xs text-slate">
+              Demo: photo check sees
+              <select
+                value={demoAi}
+                onChange={(e) => setDemoAi(e.target.value)}
+                className="rounded-lg border border-line bg-paper px-2 py-1"
+                aria-label="Demo photo check result"
+              >
+                <option value="">the real answer</option>
+                {mismatchMaterials.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+                <option value="not_scrap">not scrap</option>
+              </select>
+            </label>
+          </div>
         )}
       </section>
 
@@ -464,6 +528,86 @@ function NewSale({
 
 // Kept across screens so the demo can replay the "same photo again" fraud.
 let lastPhoto: { blob: Blob; preview: string } | null = null;
+
+// ---------- The photo check disagreed ----------
+
+/**
+ * Shown instead of sending, once. The AI is not allowed to refuse a sale — a collector who knows
+ * what is in their sack can send it anyway, and the dealer and Satin see the disagreement. So there
+ * are two doors out of this screen and neither of them is a dead end.
+ */
+function PhotoWarning({
+  ai,
+  lang,
+  sending,
+  onChange,
+  onSendAnyway,
+}: {
+  ai: PhotoMismatch;
+  lang: Lang;
+  sending: boolean;
+  onChange: () => void;
+  onSendAnyway: () => void;
+}) {
+  const line = mismatchVoice(lang, ai.material);
+  const chose = lang === "hi" ? ai.chose_label_hi : ai.chose_label_en;
+  const pct = ai.confidence == null ? null : Math.round(ai.confidence * 100);
+
+  return (
+    <main className="flex flex-1 flex-col gap-4 px-4 pb-6">
+      <div role="alert" className="animate-pop rounded-2xl bg-marigold p-5 text-ink">
+        <p className="font-display text-2xl font-semibold leading-snug">{t(lang, "photoMismatch")}</p>
+        <p className="mt-2 text-lg">{line}</p>
+        <button
+          onClick={() => speak(line, lang)}
+          className="mt-3 flex items-center gap-2 rounded-full bg-ink px-4 py-2 text-sm font-semibold text-kraft"
+        >
+          <SpeakerIcon className="h-4 w-4" /> {lang === "hi" ? "फिर से सुनें" : "Play again"}
+        </button>
+      </div>
+
+      <div className="flex items-center justify-center gap-4 rounded-2xl border border-line bg-paper p-4">
+        <div className="text-center">
+          <p className="text-xs text-slate">{t(lang, "youChose")}</p>
+          <MaterialIcon code={ai.chose} className="mx-auto my-1 h-12 w-12 text-leaf" />
+          <p className="text-sm font-semibold">{chose}</p>
+        </div>
+        <span className="text-2xl text-slate">≠</span>
+        <div className="text-center">
+          <p className="text-xs text-slate">{lang === "hi" ? "फ़ोटो में" : "In the photo"}</p>
+          {ai.material && ai.material !== "not_scrap" ? (
+            <MaterialIcon code={ai.material} className="mx-auto my-1 h-12 w-12 text-brick" />
+          ) : (
+            <StopIcon className="mx-auto my-1 h-12 w-12 text-brick" />
+          )}
+          <p className="text-sm font-semibold">
+            {ai.material === "not_scrap"
+              ? lang === "hi" ? "कबाड़ नहीं" : "Not scrap"
+              : ai.real_scene === false
+                ? lang === "hi" ? "स्क्रीन की फ़ोटो" : "A photo of a screen"
+                : (ai.material ?? "—")}
+            {pct != null && <span className="font-normal text-slate"> · {pct}%</span>}
+          </p>
+        </div>
+      </div>
+
+      <button
+        onClick={onChange}
+        disabled={sending}
+        className="h-16 rounded-2xl bg-leaf text-lg font-semibold text-white disabled:opacity-50"
+      >
+        {t(lang, "changeMaterial")}
+      </button>
+      <button
+        onClick={onSendAnyway}
+        disabled={sending}
+        className="h-14 rounded-2xl border-2 border-line bg-paper font-semibold disabled:opacity-50"
+      >
+        {sending ? "…" : t(lang, "sendAnyway")}
+      </button>
+    </main>
+  );
+}
 
 // ---------- Waiting for the dealer ----------
 
