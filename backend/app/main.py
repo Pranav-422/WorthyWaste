@@ -242,6 +242,10 @@ def me(role: str, request: Request, conn=Depends(db)):
 def health():
     return {"ok": True, "time": clock.ts(), "scripted": os.environ.get("WW_SCRIPTED") == "1",
             "demo_mode": auth.demo_mode(), "photo_check": type(adapters.photo_verifier).__name__,
+            "photo_check_model": getattr(adapters.photo_verifier, "model", None),
+            # A photo check that has quietly stopped working looks exactly like one that finds
+            # nothing wrong, so the last latency and the last failure are on the health page.
+            **adapters.photo_check_status(),
             "db": "postgres" if _db.is_pg else "sqlite"}
 
 
@@ -292,6 +296,21 @@ def _collector(conn, collector_id: int, *, full: bool) -> dict:
     return c
 
 
+@api.get("/collectors/me/requests")
+def my_requests(me_id: int = Depends(require_collector), conn=Depends(db)):
+    """The collector's own sales, in flight and recent. Two path segments, so it can never be read
+    as /collectors/{collector_id}."""
+    out = services.collector_requests(conn, me_id)
+    # The mock UPI settles when someone next asks about the request, so a list showing "paying"
+    # is what nudges it along. A real provider calls the webhook and this does nothing.
+    paying = [r["id"] for r in out if r["status"] == "paying"]
+    if paying:
+        for request_id in paying:
+            services.settle_mock_payment(conn, request_id)
+        out = services.collector_requests(conn, me_id)
+    return out
+
+
 @api.get("/collectors/by-qr/{token}")
 def collector_by_qr(token: str, request: Request, conn=Depends(db)):
     """A dealer looking up the card in their hand. They get a name and a group, nothing more."""
@@ -307,12 +326,11 @@ def collector_by_qr(token: str, request: Request, conn=Depends(db)):
 @api.get("/collectors/{collector_id}")
 def collector_profile(collector_id: int, request: Request, conn=Depends(db)):
     # A collector's full profile — income, flags, loans, score — is for them or for their lender.
-    if _session(request, "satin") is None:
-        me_id = _session(request, "collector")
-        if me_id is None:
+    own = _session(request, "collector") == collector_id
+    if not own and _session(request, "satin") is None:
+        if _session(request, "collector") is None:
             raise ApiError(401, "Please log in")
-        if me_id != collector_id:
-            raise ApiError(403, "You can only see your own profile")
+        raise ApiError(403, "You can only see your own profile")
     c = _collector(conn, collector_id, full=True)
     services.expire_stale(conn)
     s = one(conn.execute("SELECT * FROM scores WHERE collector_id = ?", (collector_id,)))
@@ -325,8 +343,12 @@ def collector_profile(collector_id: int, request: Request, conn=Depends(db)):
             "SELECT t.*, d.shop_name, m.label_en, m.label_hi FROM transactions t "
             "JOIN dealers d ON d.id = t.dealer_id JOIN materials m ON m.code = t.material "
             "WHERE t.collector_id = ? ORDER BY t.created_at DESC LIMIT 50", (collector_id,))),
+        # Satin underwrites on what actually happened. A sale still in flight is between the
+        # collector and their dealer until it completes, so Satin only sees it once it has.
         "requests": rows(conn.execute(
-            "SELECT * FROM sale_requests WHERE collector_id = ? ORDER BY id DESC LIMIT 10", (collector_id,))),
+            "SELECT * FROM sale_requests WHERE collector_id = ? " +
+            ("" if own else "AND status = 'completed' ") +
+            "ORDER BY id DESC LIMIT 10", (collector_id,))),
         "messages": [{**m, "meta": services.json_load(m.pop("meta_json"))} for m in rows(conn.execute(
             "SELECT * FROM messages WHERE collector_id = ? ORDER BY id DESC LIMIT 10", (collector_id,)))],
         "loans": rows(conn.execute("SELECT * FROM loans WHERE collector_id = ? ORDER BY id DESC", (collector_id,))),
@@ -352,6 +374,13 @@ def list_dealers(conn=Depends(db)):
     return rows(conn.execute(
         "SELECT id, shop_name, owner_name, lat, lng, scale_id, reputation, created_at "
         "FROM dealers ORDER BY id"))
+
+
+@api.get("/dealers/nearby")
+def dealers_nearby(lat: float, lng: float, me_id: int = Depends(require_collector), conn=Depends(db)):
+    """Shops the collector can pick from, nearest first. Declared before /dealers/{dealer_id} so
+    "nearby" is not read as a dealer id."""
+    return services.nearby_dealers(conn, me_id, lat, lng)
 
 
 @api.get("/dealers/{dealer_id}")
@@ -385,7 +414,10 @@ def dealer_profile(dealer_id: int, me_id: int = Depends(require_dealer), conn=De
 
 @api.get("/dealers/{dealer_id}/queue")
 def dealer_queue(dealer_id: int, me_id: int = Depends(require_dealer), conn=Depends(db)):
-    """Open requests nearby plus this dealer's in-progress ones."""
+    """Requests this collector sent to this dealer, and nobody else's.
+
+    There is no broadcast any more: a sale is a business matter between the two of them, so another
+    dealer never learns that it exists, let alone the collector's name or photo."""
     _same(me_id, dealer_id, "dealer")
     services.expire_stale(conn)
     d = one(conn.execute("SELECT * FROM dealers WHERE id = ?", (dealer_id,)))
@@ -394,16 +426,12 @@ def dealer_queue(dealer_id: int, me_id: int = Depends(require_dealer), conn=Depe
     reqs = rows(conn.execute(
         "SELECT r.*, c.name AS collector_name, c.basic_phone, m.label_en, m.rate_per_kg "
         "FROM sale_requests r JOIN collectors c ON c.id = r.collector_id JOIN materials m ON m.code = r.material "
-        "WHERE r.status = 'open' OR (r.dealer_id = ? AND r.status IN ('accepted','weighed','paying','awaiting_ivr')) "
+        "WHERE r.dealer_id = ? AND r.status IN ('open','accepted','weighed','paying','awaiting_ivr') "
         "ORDER BY r.created_at DESC", (dealer_id,)))
-    out = []
     for r in reqs:
         if r["lat"] is not None:
             r["distance_m"] = round(fraud.haversine_m(r["lat"], r["lng"], d["lat"], d["lng"]))
-            if r["status"] == "open" and r["distance_m"] > 2000:
-                continue
-        out.append(r)
-    return out
+    return reqs
 
 
 # ---------- Sale flow ----------
@@ -414,12 +442,17 @@ async def create_request(
     material: str = Form(...), est_kg: float = Form(...),
     lat: float | None = Form(None), lng: float | None = Form(None), photo: UploadFile = File(...),
     collector_id: int | None = Form(None),
+    # The shop the collector picked. Optional in the signature only so that acting as someone else
+    # is still answered with 403 rather than a validation error about a missing field.
+    dealer_id: int | None = Form(None),
     # Set after the collector has seen the photo-check warning and chosen "Send anyway".
     confirm_mismatch: bool = Form(False),
     # Demo only (WW_DEMO_MODE=1): script what the photo check "sees", to show the warning on stage.
     demo_ai_material: str | None = Form(None),
 ):
     me_id = _same(require_collector(request), collector_id, "collector")
+    if dealer_id is None:
+        raise ApiError(400, "Pick the shop you are selling to")
     data = await photo.read()
     if len(data) > 4_000_000:
         raise ApiError(413, "Photo too large")
@@ -430,31 +463,36 @@ async def create_request(
     with _tx() as conn:
         return services.create_request(conn, collector_id=me_id, material_code=material,
                                        est_kg=est_kg, lat=lat, lng=lng, photo=data,
-                                       confirm_mismatch=confirm_mismatch,
+                                       dealer_id=dealer_id, confirm_mismatch=confirm_mismatch,
                                        demo_ai_material=demo_ai_material, checked=(clean, ai))
 
 
 def _may_see_request(request: Request, req: dict) -> bool:
+    """The collector it belongs to, the dealer they chose, or Satin. Nobody else."""
     if _session(request, "satin") is not None:
         return True
     if _session(request, "collector") == req["collector_id"]:
         return True
-    dealer_id = _session(request, "dealer")
-    # Any signed-in dealer may look at a request nobody has taken yet — those are in their queue.
-    return dealer_id is not None and req["dealer_id"] in (None, dealer_id)
+    return _session(request, "dealer") == req["dealer_id"]
 
 
 @api.get("/requests/{request_id}")
 def get_request(request_id: int, request: Request, conn=Depends(db)):
     req = services.get_request(conn, request_id)
     if not _may_see_request(request, req):
-        raise ApiError(403, "This sale belongs to someone else")
+        # Same answer as for a request that does not exist: "someone else's" would confirm it does.
+        raise ApiError(404, "Request not found")
     services.settle_mock_payment(conn, request_id)
     req = services.get_request(conn, request_id)
     tx = one(conn.execute("SELECT * FROM transactions WHERE request_id = ?", (request_id,)))
     pay = one(conn.execute("SELECT * FROM payments WHERE request_id = ? ORDER BY id DESC", (request_id,)))
     m = services.material(conn, req["material"])
     return {"request": req, "transaction": tx, "payment": pay, "material": m}
+
+
+@api.post("/requests/{request_id}/cancel")
+def cancel_request(request_id: int, me_id: int = Depends(require_collector), conn=Depends(db)):
+    return services.cancel_request(conn, request_id, collector_id=me_id)
 
 
 class AcceptBody(BaseModel):
@@ -731,7 +769,7 @@ def demo_simulate_scan(request_id: int, body: SimulateScanBody,
                        me_id: int = Depends(require_dealer), conn=Depends(db)):
     """Stands in for pointing the camera at the collector's QR card. The token stays on the server:
     dealers are never told a collector's QR token, so the scan has to be simulated here."""
-    req = services.get_request(conn, request_id)
+    req = services.dealer_request(conn, request_id, me_id)
     c = one(conn.execute("SELECT qr_token FROM collectors WHERE id = ?", (req["collector_id"],)))
     if not c:
         raise ApiError(404, "Collector not found")
@@ -743,9 +781,7 @@ def demo_simulate_scan(request_id: int, body: SimulateScanBody,
 def demo_ivr_confirm(request_id: int, me_id: int = Depends(require_dealer), conn=Depends(db)):
     """The dealer's "collector presses 1" button. The real /ivr/confirm needs the provider's
     signature and the collector's caller ID; this looks the phone number up instead."""
-    req = services.get_request(conn, request_id)
-    if req["dealer_id"] != me_id:
-        raise ApiError(403, "This request was started by another dealer")
+    req = services.dealer_request(conn, request_id, me_id)
     c = one(conn.execute("SELECT phone FROM collectors WHERE id = ?", (req["collector_id"],)))
     return services.ivr_confirm(conn, request_id=request_id, caller_phone=c["phone"], digit="1")
 

@@ -1,6 +1,7 @@
 """Transaction flow: request → accept → weigh → approve → payment webhook → transaction.
 A sale becomes a transaction only once payment succeeds."""
 import json
+import logging
 import secrets
 import uuid
 from datetime import timedelta
@@ -8,6 +9,8 @@ from datetime import timedelta
 
 from . import adapters, auth, clock, fraud, phash, score
 from .db import one, rows
+
+log = logging.getLogger("worthywaste.services")
 
 REQUEST_TTL_MIN = 15
 CREDITS_PER_KG = 1
@@ -39,6 +42,35 @@ def get_request(conn, request_id: int) -> dict:
     return req
 
 
+def dealer_request(conn, request_id: int, dealer_id: int) -> dict:
+    """A request as its chosen dealer sees it.
+
+    A sale is between one collector and one dealer, so any other dealer gets the same answer as for
+    a request that does not exist. 403 would tell them that Meena has a sale running somewhere."""
+    req = get_request(conn, request_id)
+    if req["dealer_id"] != dealer_id:
+        raise ApiError(404, "Request not found")
+    return req
+
+
+def nearby_dealers(conn, collector_id: int, lat: float, lng: float) -> list[dict]:
+    """Shops the collector could walk to, nearest first. Shop name and distance only: a collector
+    picking a shop has no business knowing its phone number or where its money goes."""
+    last = one(conn.execute(
+        "SELECT dealer_id FROM transactions WHERE collector_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        (collector_id,)))
+    last_used = last["dealer_id"] if last else None
+    out = []
+    for d in rows(conn.execute("SELECT id, shop_name, lat, lng FROM dealers ORDER BY id")):
+        distance = fraud.haversine_m(lat, lng, d["lat"], d["lng"])
+        if distance > fraud.DEALER_CHOICE_MAX_M:
+            continue
+        out.append({"id": d["id"], "shop_name": d["shop_name"], "distance_m": round(distance),
+                    "last_used": d["id"] == last_used})
+    out.sort(key=lambda r: r["distance_m"])
+    return out
+
+
 def material(conn, code: str) -> dict:
     m = one(conn.execute("SELECT * FROM materials WHERE code = ?", (code,)))
     if not m:
@@ -58,6 +90,9 @@ def verify_photo(selected_material: str, jpeg: bytes) -> dict:
     try:
         check = adapters.photo_verifier.check(jpeg, selected_material)
     except Exception as e:  # a broken adapter must not cost the collector their sale
+        reason = f"{type(e).__name__}: {e}"
+        adapters.record_photo_check(error=reason)
+        log.warning("photo check adapter raised: %s", reason)
         check = adapters.PhotoCheck.unavailable(f"Photo check failed ({type(e).__name__})")
     return fraud.photo_verdict(selected_material, check)
 
@@ -84,7 +119,7 @@ def check_photo(material_code: str, photo: bytes, demo_ai_material: str | None =
 
 
 def create_request(conn, *, collector_id: int, material_code: str, est_kg: float,
-                   lat: float | None, lng: float | None, photo: bytes,
+                   lat: float | None, lng: float | None, photo: bytes, dealer_id: int,
                    confirm_mismatch: bool = False, demo_ai_material: str | None = None,
                    checked: tuple[bytes, dict] | None = None) -> dict:
     """`checked` is check_photo()'s result when the caller already ran it outside the transaction."""
@@ -94,6 +129,18 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
     m = material(conn, material_code)
     if not (0 < est_kg <= 500):
         raise ApiError(400, "Estimated weight must be between 0 and 500 kg")
+    # The collector picks the shop, so the request is private to the two of them from the start.
+    d = one(conn.execute("SELECT id, shop_name, lat, lng FROM dealers WHERE id = ?", (dealer_id,)))
+    if not d:
+        raise ApiError(404, "That shop is not registered")
+    if lat is None or lng is None:
+        raise ApiError(400, "Location needed to pick a shop — turn on GPS and try again",
+                       rule="location_missing")
+    distance = fraud.haversine_m(lat, lng, d["lat"], d["lng"])
+    if distance > fraud.DEALER_CHOICE_MAX_M:
+        raise ApiError(403, f"{d['shop_name']} is {distance / 1000:,.1f} km away — pick a shop within "
+                            f"{fraud.DEALER_CHOICE_MAX_M // 1000} km",
+                       rule="dealer_too_far", evidence={"distance_m": round(distance)})
     try:
         phash_hex = photo_phash(photo)
     except Exception:
@@ -122,10 +169,10 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
     conn.execute("INSERT INTO photos (name, data, created_at) VALUES (?,?,?)", (name, clean, clock.ts()))
     now = clock.now()
     cur = conn.execute(
-        "INSERT INTO sale_requests (collector_id, material, est_kg, photo_url, photo_phash, lat, lng, "
-        "ai_material, ai_confidence, ai_verdict, ai_notes, ai_real_scene, "
-        "status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?)",
-        (collector_id, material_code, est_kg, f"/api/photos/{name}", phash_hex, lat, lng,
+        "INSERT INTO sale_requests (collector_id, dealer_id, material, est_kg, photo_url, photo_phash, "
+        "lat, lng, ai_material, ai_confidence, ai_verdict, ai_notes, ai_real_scene, "
+        "status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?)",
+        (collector_id, dealer_id, material_code, est_kg, f"/api/photos/{name}", phash_hex, lat, lng,
          ai["material"], ai["confidence"], ai["verdict"], ai["notes"],
          None if ai["real_scene"] is None else int(ai["real_scene"]),
          clock.ts(now), clock.ts(now + timedelta(minutes=REQUEST_TTL_MIN))),
@@ -141,16 +188,16 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
 
 def accept_request(conn, request_id: int, *, dealer_id: int, qr_token: str,
                    lat: float, lng: float) -> dict:
-    req = get_request(conn, request_id)
+    req = dealer_request(conn, request_id, dealer_id)
     if req["status"] == "expired":
         raise ApiError(410, "Request expired — ask the collector to send a new one", rule="request_expiry")
+    if req["status"] == "cancelled":
+        raise ApiError(409, "The collector cancelled this request")
     if req["status"] != "open":
         raise ApiError(409, f"Request is already {req['status']}")
     c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (req["collector_id"],)))
     if c["qr_token"] != qr_token:
         raise ApiError(403, "QR card does not belong to this request's collector", rule="qr_mismatch")
-    if not one(conn.execute("SELECT id FROM dealers WHERE id = ?", (dealer_id,))):
-        raise ApiError(404, "Dealer not found")
     try:
         d = fraud.check_location(req, lat, lng)
     except fraud.Blocked as b:
@@ -158,12 +205,12 @@ def accept_request(conn, request_id: int, *, dealer_id: int, qr_token: str,
     # Guarded update, not just the check above: two dealer phones (or two serverless instances) can
     # reach this line at the same time, and only the one that still sees 'open' may take the request.
     cur = conn.execute(
-        "UPDATE sale_requests SET status='accepted', dealer_id=?, dealer_lat=?, dealer_lng=?, gps_distance_m=? "
+        "UPDATE sale_requests SET status='accepted', dealer_lat=?, dealer_lng=?, gps_distance_m=? "
         "WHERE id=? AND status='open'",
-        (dealer_id, lat, lng, round(d, 1), request_id),
+        (lat, lng, round(d, 1), request_id),
     )
     if cur.rowcount == 0:
-        raise ApiError(409, "Another dealer has already taken this request")
+        raise ApiError(409, f"This request is already {get_request(conn, request_id)['status']}")
     return get_request(conn, request_id)
 
 
@@ -172,9 +219,7 @@ def accept_request(conn, request_id: int, *, dealer_id: int, qr_token: str,
 def weigh_request(conn, request_id: int, *, dealer_id: int, mode: str = "normal") -> dict:
     if mode != "normal" and not auth.demo_mode():
         raise ApiError(403, "Scale simulation modes are only available in demo mode")
-    req = get_request(conn, request_id)
-    if req["dealer_id"] != dealer_id:
-        raise ApiError(403, "This request was accepted by another dealer")
+    req = dealer_request(conn, request_id, dealer_id)
     if req["status"] not in ("accepted", "weighed"):
         raise ApiError(409, f"Cannot weigh a request that is {req['status']}")
     dealer = one(conn.execute("SELECT * FROM dealers WHERE id = ?", (dealer_id,)))
@@ -216,9 +261,7 @@ def pay_amount(kg: float, rate: float) -> int:
 def approve_request(conn, request_id: int, *, dealer_id: int, dealer_material: str | None = None) -> dict:
     """`dealer_material` is what the dealer confirmed with the scrap in front of them. It decides the
     rate, so the amount paid, the credits' batch and the traceable record all follow the dealer."""
-    req = get_request(conn, request_id)
-    if req["dealer_id"] != dealer_id:
-        raise ApiError(403, "This request was accepted by another dealer")
+    req = dealer_request(conn, request_id, dealer_id)
     if req["status"] == "paying":
         # A repeat tap on "Approve and pay": show the payment already running, never start a second.
         p = one(conn.execute("SELECT * FROM payments WHERE request_id = ? ORDER BY id DESC", (request_id,)))
@@ -381,6 +424,34 @@ def ivr_start(conn, *, dealer_id: int, qr_token: str, material_code: str, est_kg
               f"Sale of {est_kg:g} kg {m['label_en'].lower()} to {d['shop_name']}. Press 1 to confirm.")
     adapters.messages.send(conn, c["id"], "ivr", c["language"], prompt)
     return {"request": get_request(conn, cur.lastrowid), "ivr_prompt": prompt, "calling": c["phone"]}
+
+
+def cancel_request(conn, request_id: int, *, collector_id: int) -> dict:
+    """The collector changed their mind, or walked to a different shop. Only while nobody has acted
+    on it: once a dealer has accepted, the two of them are standing together and sort it out there."""
+    req = get_request(conn, request_id)
+    if req["collector_id"] != collector_id:
+        raise ApiError(404, "Request not found")
+    cur = conn.execute(
+        "UPDATE sale_requests SET status='cancelled', reject_reason=? WHERE id=? AND status='open'",
+        ("Cancelled by the collector", request_id))
+    if cur.rowcount == 0:
+        raise ApiError(409, f"Cannot cancel a request that is {get_request(conn, request_id)['status']}")
+    return get_request(conn, request_id)
+
+
+def collector_requests(conn, collector_id: int, limit: int = 20) -> list[dict]:
+    """The collector's own sales, in flight and recent, with the shop and the amount once paid."""
+    expire_stale(conn)
+    return rows(conn.execute(
+        "SELECT r.id, r.material, r.est_kg, r.scale_kg, r.status, r.created_at, r.expires_at, "
+        "r.dealer_material, r.ai_verdict, r.ai_material, r.photo_url, "
+        "d.shop_name, m.label_en, m.label_hi, t.amount, t.credits "
+        "FROM sale_requests r "
+        "LEFT JOIN dealers d ON d.id = r.dealer_id "
+        "JOIN materials m ON m.code = r.material "
+        "LEFT JOIN transactions t ON t.request_id = r.id "
+        "WHERE r.collector_id = ? ORDER BY r.id DESC LIMIT ?", (collector_id, limit)))
 
 
 def ivr_confirm(conn, *, request_id: int, caller_phone: str, digit: str) -> dict:

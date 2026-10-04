@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS sale_requests (
   lng           REAL,
   channel       TEXT NOT NULL DEFAULT 'app',     -- app | ivr
   status        TEXT NOT NULL DEFAULT 'open',
-    -- open, accepted, weighed, paying, completed, expired, rejected, awaiting_ivr
+    -- open, accepted, weighed, paying, completed, expired, rejected, cancelled, awaiting_ivr
   dealer_lat    REAL,
   dealer_lng    REAL,
   gps_distance_m REAL,
@@ -220,6 +220,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_tx_collector ON transactions(collector_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tx_dealer ON transactions(dealer_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_req_status ON sale_requests(status);
+CREATE INDEX IF NOT EXISTS idx_req_dealer ON sale_requests(dealer_id, status);
 CREATE INDEX IF NOT EXISTS idx_upi_from ON upi_events(from_vpa, at);
 CREATE INDEX IF NOT EXISTS idx_req_collector ON sale_requests(collector_id, created_at);
 """
