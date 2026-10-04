@@ -227,8 +227,8 @@ export default function Home() {
       <section className="kraft">
         <div className="mx-auto flex max-w-6xl flex-col items-start gap-5 px-4 py-14 md:flex-row md:items-center md:justify-between">
           <div>
-            <h2 className="text-3xl font-bold">Try it with the sample accounts</h2>
-            <p className="mt-1 text-slate">Collector Meena (98100 00001) and dealer Raju (98110 00001), PIN 1234.</p>
+            <h2 className="text-3xl font-bold">Ready to sell, buy or lend?</h2>
+            <p className="mt-1 text-slate">Log in with your phone number and PIN.</p>
           </div>
           <div className="flex flex-wrap gap-3">
             <Link href="/login?role=collector" className="flex h-12 items-center rounded-2xl bg-leaf px-5 font-semibold text-white">Collector login</Link>

@@ -14,6 +14,7 @@ GPS_MAX_DISTANCE_M = 50
 # How far a collector may be from the shop they pick. Wider than GPS_MAX_DISTANCE_M on purpose: at
 # this point they are choosing where to walk to, not standing at the scale.
 DEALER_CHOICE_MAX_M = 5000
+SHOP_LOCATION_MAX_ACCURACY_M = 100  # a shop pinned from a worse GPS fix could land on the wrong street
 WEIGHT_GAP_PCT = 0.10
 WEIGHT_GAP_REPEATS = 3
 WEIGHT_GAP_WINDOW_DAYS = 7

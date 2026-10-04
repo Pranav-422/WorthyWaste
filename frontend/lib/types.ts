@@ -182,6 +182,8 @@ export type Dealer = {
   scale_id: string;
   upi_vpa: string;
   reputation: number;
+  /** When the dealer last pinned the shop from their phone; null = never (collectors may not find it). */
+  location_set_at: string | null;
 };
 
 export type MassBalance = { bought_kg: number; sold_kg: number; gap_pct: number | null };
