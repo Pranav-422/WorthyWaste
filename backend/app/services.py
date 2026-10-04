@@ -1,13 +1,16 @@
 """Transaction flow: request → accept → weigh → approve → payment webhook → transaction.
 A sale becomes a transaction only once payment succeeds."""
 import json
+import logging
 import secrets
 import uuid
 from datetime import timedelta
 
 
-from . import adapters, clock, fraud, phash, score
+from . import adapters, auth, clock, fraud, phash, score
 from .db import one, rows
+
+log = logging.getLogger("worthywaste.services")
 
 REQUEST_TTL_MIN = 15
 CREDITS_PER_KG = 1
@@ -39,6 +42,35 @@ def get_request(conn, request_id: int) -> dict:
     return req
 
 
+def dealer_request(conn, request_id: int, dealer_id: int) -> dict:
+    """A request as its chosen dealer sees it.
+
+    A sale is between one collector and one dealer, so any other dealer gets the same answer as for
+    a request that does not exist. 403 would tell them that Meena has a sale running somewhere."""
+    req = get_request(conn, request_id)
+    if req["dealer_id"] != dealer_id:
+        raise ApiError(404, "Request not found")
+    return req
+
+
+def nearby_dealers(conn, collector_id: int, lat: float, lng: float) -> list[dict]:
+    """Shops the collector could walk to, nearest first. Shop name and distance only: a collector
+    picking a shop has no business knowing its phone number or where its money goes."""
+    last = one(conn.execute(
+        "SELECT dealer_id FROM transactions WHERE collector_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        (collector_id,)))
+    last_used = last["dealer_id"] if last else None
+    out = []
+    for d in rows(conn.execute("SELECT id, shop_name, lat, lng FROM dealers ORDER BY id")):
+        distance = fraud.haversine_m(lat, lng, d["lat"], d["lng"])
+        if distance > fraud.DEALER_CHOICE_MAX_M:
+            continue
+        out.append({"id": d["id"], "shop_name": d["shop_name"], "distance_m": round(distance),
+                    "last_used": d["id"] == last_used})
+    out.sort(key=lambda r: r["distance_m"])
+    return out
+
+
 def material(conn, code: str) -> dict:
     m = one(conn.execute("SELECT * FROM materials WHERE code = ?", (code,)))
     if not m:
@@ -50,86 +82,167 @@ def photo_phash(data: bytes) -> str:
     return phash.phash(data)
 
 
-# ---------- Step 1: collector raises a request ----------
-
-def create_request(conn, *, collector_id: int, material_code: str, est_kg: float,
-                   lat: float | None, lng: float | None, photo: bytes) -> dict:
-    c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (collector_id,)))
-    if not c:
-        raise ApiError(404, "Collector not found")
-    material(conn, material_code)
-    if not (0 < est_kg <= 500):
-        raise ApiError(400, "Estimated weight must be between 0 and 500 kg")
+def photo_hash_or_400(data: bytes) -> str:
     try:
-        phash_hex = photo_phash(photo)
+        return photo_phash(data)
     except Exception:
         raise ApiError(400, "Photo could not be read")
 
+
+def refuse_duplicate_photo(conn, collector_id: int, phash_hex: str) -> None:
+    """Refuse a photo already used in the last 30 days, and record the attempt for Satin."""
     dup = fraud.find_duplicate_photo(conn, phash_hex)
-    if dup:
-        same = dup["collector_id"] == collector_id
-        flag = lambda c: fraud.raise_flag(  # noqa: E731
-            c, entity_type="collector", entity_id=collector_id, rule="duplicate_photo",
-            detail=("Reused a photo from" if same else "Used another collector's photo from")
-                   + f" request #{dup['request_id']} (hash distance {dup['distance']})",
-            evidence=dup, collector_id=collector_id, dedupe_hours=1,
-        )
-        raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
+    if not dup:
+        return
+    same = dup["collector_id"] == collector_id
+    flag = lambda c: fraud.raise_flag(  # noqa: E731
+        c, entity_type="collector", entity_id=collector_id, rule="duplicate_photo",
+        detail=("Reused a photo from" if same else "Used another collector's photo from")
+               + f" request #{dup['request_id']} (hash distance {dup['distance']})",
+        evidence=dup, collector_id=collector_id, dedupe_hours=1,
+    )
+    raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
+
+
+# ---------- Step 1: collector raises a request ----------
+
+def verify_photo(selected_material: str, jpeg: bytes) -> dict:
+    """Ask the photo verifier whether the photo shows what the collector selected. Any failure comes
+    back as the 'unchecked' verdict: the AI is an extra pair of eyes, never a gate."""
+    try:
+        check = adapters.photo_verifier.check(jpeg, selected_material)
+    except Exception as e:  # a broken adapter must not cost the collector their sale
+        reason = f"{type(e).__name__}: {e}"
+        adapters.record_photo_check(error=reason)
+        log.warning("photo check adapter raised: %s", reason)
+        check = adapters.PhotoCheck.unavailable(f"Photo check failed ({type(e).__name__})")
+    return fraud.photo_verdict(selected_material, check)
+
+
+def check_photo(material_code: str, photo: bytes, demo_ai_material: str | None = None) -> tuple[bytes, dict]:
+    """Re-encode the photo and run the photo check. Needs no database, so the API runs it before taking
+    a connection: the verifier is a network call that can take seconds.
+
+    Re-encoding comes first because Pillow writes pixels only, so EXIF (including the GPS tags phones
+    embed) is gone, both from what we send the verifier and from what we store."""
+    try:
+        clean = adapters.reencode_jpeg(photo)
+    except Exception:
+        raise ApiError(400, "Photo could not be read")
+    if demo_ai_material and auth.demo_mode():
+        # Demo only: script what the photo check "saw", so the mismatch warning can be shown on stage
+        # without hunting for a photo the real model gets wrong.
+        ai = fraud.photo_verdict(material_code, adapters.PhotoCheck(
+            available=True, material=demo_ai_material, confidence=0.87, real_scene=True,
+            approx_quantity="one full sack", notes="Scripted demo photo check"))
+    else:
+        ai = verify_photo(material_code, clean)
+    return clean, ai
+
+
+def create_request(conn, *, collector_id: int, material_code: str, est_kg: float,
+                   lat: float | None, lng: float | None, photo: bytes, dealer_id: int,
+                   confirm_mismatch: bool = False, demo_ai_material: str | None = None,
+                   checked: tuple[bytes, dict] | None = None) -> dict:
+    """`checked` is check_photo()'s result when the caller already ran it outside the transaction."""
+    c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (collector_id,)))
+    if not c:
+        raise ApiError(404, "Collector not found")
+    m = material(conn, material_code)
+    if not (0 < est_kg <= 500):
+        raise ApiError(400, "Estimated weight must be between 0 and 500 kg")
+    # The collector picks the shop, so the request is private to the two of them from the start.
+    d = one(conn.execute("SELECT id, shop_name, lat, lng FROM dealers WHERE id = ?", (dealer_id,)))
+    if not d:
+        raise ApiError(404, "That shop is not registered")
+    if lat is None or lng is None:
+        raise ApiError(400, "Location needed to pick a shop — turn on GPS and try again",
+                       rule="location_missing")
+    distance = fraud.haversine_m(lat, lng, d["lat"], d["lng"])
+    if distance > fraud.DEALER_CHOICE_MAX_M:
+        raise ApiError(403, f"{d['shop_name']} is {distance / 1000:,.1f} km away — pick a shop within "
+                            f"{fraud.DEALER_CHOICE_MAX_M // 1000} km",
+                       rule="dealer_too_far", evidence={"distance_m": round(distance)})
+    phash_hex = photo_hash_or_400(photo)
+    refuse_duplicate_photo(conn, collector_id, phash_hex)
+
+    clean, ai = checked or check_photo(material_code, photo, demo_ai_material)
+
+    if ai["verdict"] == "mismatch" and not confirm_mismatch:
+        # Warn once, don't refuse: the collector can fix the material or send it anyway.
+        raise ApiError(409, "This photo may not match the scrap you chose", rule="photo_mismatch",
+                       evidence={"chose": material_code, "chose_label_hi": m["label_hi"],
+                                 "chose_label_en": m["label_en"], **ai})
 
     name = f"{uuid.uuid4().hex}.jpg"
-    conn.execute("INSERT INTO photos (name, data, created_at) VALUES (?,?,?)", (name, photo, clock.ts()))
+    conn.execute("INSERT INTO photos (name, data, created_at) VALUES (?,?,?)", (name, clean, clock.ts()))
     now = clock.now()
     cur = conn.execute(
-        "INSERT INTO sale_requests (collector_id, material, est_kg, photo_url, photo_phash, lat, lng, "
-        "status, created_at, expires_at) VALUES (?,?,?,?,?,?,?, 'open', ?, ?)",
-        (collector_id, material_code, est_kg, f"/api/photos/{name}", phash_hex, lat, lng,
+        "INSERT INTO sale_requests (collector_id, dealer_id, material, est_kg, photo_url, photo_phash, "
+        "lat, lng, ai_material, ai_confidence, ai_verdict, ai_notes, ai_real_scene, "
+        "status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?)",
+        (collector_id, dealer_id, material_code, est_kg, f"/api/photos/{name}", phash_hex, lat, lng,
+         ai["material"], ai["confidence"], ai["verdict"], ai["notes"],
+         None if ai["real_scene"] is None else int(ai["real_scene"]),
          clock.ts(now), clock.ts(now + timedelta(minutes=REQUEST_TTL_MIN))),
     )
-    return get_request(conn, cur.lastrowid)
+    req = get_request(conn, cur.lastrowid)
+    if ai["verdict"] == "mismatch":
+        # Recorded on the request either way; only a pattern of them becomes a flag.
+        fraud.check_photo_mismatch(conn, req)
+    return req
 
 
 # ---------- Step 2: dealer scans QR and accepts ----------
 
 def accept_request(conn, request_id: int, *, dealer_id: int, qr_token: str,
                    lat: float, lng: float) -> dict:
-    req = get_request(conn, request_id)
+    req = dealer_request(conn, request_id, dealer_id)
     if req["status"] == "expired":
         raise ApiError(410, "Request expired — ask the collector to send a new one", rule="request_expiry")
+    if req["status"] == "cancelled":
+        raise ApiError(409, "The collector cancelled this request")
     if req["status"] != "open":
         raise ApiError(409, f"Request is already {req['status']}")
     c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (req["collector_id"],)))
     if c["qr_token"] != qr_token:
         raise ApiError(403, "QR card does not belong to this request's collector", rule="qr_mismatch")
-    if not one(conn.execute("SELECT id FROM dealers WHERE id = ?", (dealer_id,))):
-        raise ApiError(404, "Dealer not found")
     try:
         d = fraud.check_location(req, lat, lng)
     except fraud.Blocked as b:
         raise ApiError(403, b.message, rule=b.rule, evidence=b.evidence)
-    conn.execute(
-        "UPDATE sale_requests SET status='accepted', dealer_id=?, dealer_lat=?, dealer_lng=?, gps_distance_m=? "
-        "WHERE id=?",
-        (dealer_id, lat, lng, round(d, 1), request_id),
+    # Guarded update, not just the check above: two dealer phones (or two serverless instances) can
+    # reach this line at the same time, and only the one that still sees 'open' may take the request.
+    cur = conn.execute(
+        "UPDATE sale_requests SET status='accepted', dealer_lat=?, dealer_lng=?, gps_distance_m=? "
+        "WHERE id=? AND status='open'",
+        (lat, lng, round(d, 1), request_id),
     )
+    if cur.rowcount == 0:
+        raise ApiError(409, f"This request is already {get_request(conn, request_id)['status']}")
     return get_request(conn, request_id)
 
 
 # ---------- Step 3: dealer weighs on the scale ----------
 
 def weigh_request(conn, request_id: int, *, dealer_id: int, mode: str = "normal") -> dict:
-    req = get_request(conn, request_id)
-    if req["dealer_id"] != dealer_id:
-        raise ApiError(403, "This request was accepted by another dealer")
+    if mode != "normal" and not auth.demo_mode():
+        raise ApiError(403, "Scale simulation modes are only available in demo mode")
+    req = dealer_request(conn, request_id, dealer_id)
     if req["status"] not in ("accepted", "weighed"):
         raise ApiError(409, f"Cannot weigh a request that is {req['status']}")
     dealer = one(conn.execute("SELECT * FROM dealers WHERE id = ?", (dealer_id,)))
     reading = adapters.scale.read(dealer["scale_id"], req["est_kg"], mode)
     if reading.kg <= 0:
         raise ApiError(400, "Scale returned no weight — put the scrap on the scale")
-    conn.execute(
-        "UPDATE sale_requests SET status='weighed', scale_kg=?, scale_source=? WHERE id=?",
+    # Re-weighing is allowed, paying is not: once the request has moved on, this update finds no row.
+    cur = conn.execute(
+        "UPDATE sale_requests SET status='weighed', scale_kg=?, scale_source=? "
+        "WHERE id=? AND status IN ('accepted','weighed')",
         (reading.kg, reading.source, request_id),
     )
+    if cur.rowcount == 0:
+        raise ApiError(409, f"Cannot weigh a request that is {get_request(conn, request_id)['status']}")
     req = get_request(conn, request_id)
     collector = one(conn.execute("SELECT equipment FROM collectors WHERE id = ?", (req["collector_id"],)))
     gap = fraud.check_weight_gap(conn, req, reading.kg)
@@ -137,6 +250,7 @@ def weigh_request(conn, request_id: int, *, dealer_id: int, mode: str = "normal"
     rate = material(conn, req["material"])["rate_per_kg"]
     return {
         "request": req,
+        "material": req["material"],   # the collector's choice; the dealer confirms it before paying
         "scale_kg": reading.kg,
         "scale_source": reading.source,
         "rate_per_kg": rate,
@@ -153,25 +267,33 @@ def pay_amount(kg: float, rate: float) -> int:
 
 # ---------- Step 4: dealer approves → UPI ----------
 
-def approve_request(conn, request_id: int, *, dealer_id: int) -> dict:
-    req = get_request(conn, request_id)
-    if req["dealer_id"] != dealer_id:
-        raise ApiError(403, "This request was accepted by another dealer")
+def approve_request(conn, request_id: int, *, dealer_id: int, dealer_material: str | None = None) -> dict:
+    """`dealer_material` is what the dealer confirmed with the scrap in front of them. It decides the
+    rate, so the amount paid, the credits' batch and the traceable record all follow the dealer."""
+    req = dealer_request(conn, request_id, dealer_id)
     if req["status"] == "paying":
+        # A repeat tap on "Approve and pay": show the payment already running, never start a second.
         p = one(conn.execute("SELECT * FROM payments WHERE request_id = ? ORDER BY id DESC", (request_id,)))
         return {"payment": p, "request": req}
     if req["status"] != "weighed":
         raise ApiError(409, "Weigh the scrap on the scale before paying")
+    confirmed = dealer_material or req["dealer_material"] or req["material"]
+    m = material(conn, confirmed)
+    # Claim the request before initiating payment: if this finds no row another instance already has
+    # it, and we must not ask the aggregator for a second transfer.
+    cur = conn.execute("UPDATE sale_requests SET status='paying', dealer_material=? "
+                       "WHERE id=? AND status='weighed'", (confirmed, request_id))
+    if cur.rowcount == 0:
+        raise ApiError(409, f"This sale is already {get_request(conn, request_id)['status']}")
     dealer = one(conn.execute("SELECT * FROM dealers WHERE id = ?", (dealer_id,)))
     collector = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (req["collector_id"],)))
-    amount = pay_amount(req["scale_kg"], material(conn, req["material"])["rate_per_kg"])
+    amount = pay_amount(req["scale_kg"], m["rate_per_kg"])
     init = adapters.payments.initiate(dealer["upi_vpa"], collector["upi_vpa"], amount)
     conn.execute(
         "INSERT INTO payments (request_id, amount, payer_vpa, payee_vpa, provider_ref, status, created_at) "
         "VALUES (?,?,?,?,?, 'pending', ?)",
         (request_id, amount, dealer["upi_vpa"], collector["upi_vpa"], init.provider_ref, clock.ts()),
     )
-    conn.execute("UPDATE sale_requests SET status='paying' WHERE id=?", (request_id,))
     p = one(conn.execute("SELECT * FROM payments WHERE provider_ref = ?", (init.provider_ref,)))
     return {"payment": p, "request": get_request(conn, request_id)}
 
@@ -179,17 +301,24 @@ def approve_request(conn, request_id: int, *, dealer_id: int) -> dict:
 # ---------- Step 5: payment webhook → transaction, credits, message ----------
 
 def payment_webhook(conn, provider_ref: str, status: str) -> dict:
+    """Providers retry webhooks, and two instances can be told about the same payment at once. The
+    status change is the guard: whoever moves the row off 'pending' is the one that books the sale."""
     p = one(conn.execute("SELECT * FROM payments WHERE provider_ref = ?", (provider_ref,)))
     if not p:
         raise ApiError(404, "Unknown payment")
-    if p["status"] != "pending":
-        return {"payment": p, "duplicate": True}
     if status != "success":
-        conn.execute("UPDATE payments SET status='failed' WHERE id=?", (p["id"],))
-        conn.execute("UPDATE sale_requests SET status='weighed' WHERE id=?", (p["request_id"],))
+        cur = conn.execute("UPDATE payments SET status='failed' WHERE provider_ref=? AND status='pending'",
+                           (provider_ref,))
+        if cur.rowcount == 0:
+            return {"payment": p, "duplicate": True}
+        conn.execute("UPDATE sale_requests SET status='weighed' WHERE id=? AND status='paying'",
+                     (p["request_id"],))
         return {"payment": {**p, "status": "failed"}}
 
-    conn.execute("UPDATE payments SET status='success' WHERE id=?", (p["id"],))
+    cur = conn.execute("UPDATE payments SET status='success' WHERE provider_ref=? AND status='pending'",
+                       (provider_ref,))
+    if cur.rowcount == 0:
+        return {"payment": p, "duplicate": True}
     req = get_request(conn, p["request_id"])
     tx = record_transaction(conn, req, amount=p["amount"], upi_ref=provider_ref,
                             payer_vpa=p["payer_vpa"], payee_vpa=p["payee_vpa"])
@@ -210,15 +339,17 @@ def settle_mock_payment(conn, request_id: int) -> None:
 
 def record_transaction(conn, req: dict, *, amount: float, upi_ref: str,
                        payer_vpa: str, payee_vpa: str, notify: bool = True) -> dict:
-    m = material(conn, req["material"])
+    # The dealer confirmed the material at the scale; that is what was actually bought and traced.
+    confirmed = req.get("dealer_material") or req["material"]
+    m = material(conn, confirmed)
     credits = int(round(req["scale_kg"] * CREDITS_PER_KG))
-    batch_id = open_batch(conn, req["dealer_id"], req["material"])
+    batch_id = open_batch(conn, req["dealer_id"], confirmed)
     now = clock.ts()
     cur = conn.execute(
         "INSERT INTO transactions (request_id, collector_id, dealer_id, material, est_kg, scale_kg, "
         "rate_per_kg, amount, upi_ref, dealer_lat, dealer_lng, credits, batch_id, created_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (req["id"], req["collector_id"], req["dealer_id"], req["material"], req["est_kg"],
+        (req["id"], req["collector_id"], req["dealer_id"], confirmed, req["est_kg"],
          req["scale_kg"], m["rate_per_kg"], amount, upi_ref, req["dealer_lat"], req["dealer_lng"],
          credits, batch_id, now),
     )
@@ -231,6 +362,9 @@ def record_transaction(conn, req: dict, *, amount: float, upi_ref: str,
     )
     fraud.check_circular(conn, one(conn.execute("SELECT * FROM upi_events WHERE id=?", (ev.lastrowid,))))
     fraud.check_pair_frequency(conn, req["dealer_id"], req["collector_id"])
+    if req.get("dealer_material"):
+        # A human looked at the scrap and called it something else: worth Satin's review.
+        fraud.check_material_override(conn, req, req["dealer_material"])
 
     if notify:
         c = one(conn.execute("SELECT * FROM collectors WHERE id = ?", (req["collector_id"],)))
@@ -301,6 +435,34 @@ def ivr_start(conn, *, dealer_id: int, qr_token: str, material_code: str, est_kg
     return {"request": get_request(conn, cur.lastrowid), "ivr_prompt": prompt, "calling": c["phone"]}
 
 
+def cancel_request(conn, request_id: int, *, collector_id: int) -> dict:
+    """The collector changed their mind, or walked to a different shop. Only while nobody has acted
+    on it: once a dealer has accepted, the two of them are standing together and sort it out there."""
+    req = get_request(conn, request_id)
+    if req["collector_id"] != collector_id:
+        raise ApiError(404, "Request not found")
+    cur = conn.execute(
+        "UPDATE sale_requests SET status='cancelled', reject_reason=? WHERE id=? AND status='open'",
+        ("Cancelled by the collector", request_id))
+    if cur.rowcount == 0:
+        raise ApiError(409, f"Cannot cancel a request that is {get_request(conn, request_id)['status']}")
+    return get_request(conn, request_id)
+
+
+def collector_requests(conn, collector_id: int, limit: int = 20) -> list[dict]:
+    """The collector's own sales, in flight and recent, with the shop and the amount once paid."""
+    expire_stale(conn)
+    return rows(conn.execute(
+        "SELECT r.id, r.material, r.est_kg, r.scale_kg, r.status, r.created_at, r.expires_at, "
+        "r.dealer_material, r.ai_verdict, r.ai_material, r.photo_url, "
+        "d.shop_name, m.label_en, m.label_hi, t.amount, t.credits "
+        "FROM sale_requests r "
+        "LEFT JOIN dealers d ON d.id = r.dealer_id "
+        "JOIN materials m ON m.code = r.material "
+        "LEFT JOIN transactions t ON t.request_id = r.id "
+        "WHERE r.collector_id = ? ORDER BY r.id DESC LIMIT ?", (collector_id, limit)))
+
+
 def ivr_confirm(conn, *, request_id: int, caller_phone: str, digit: str) -> dict:
     req = get_request(conn, request_id)
     if req["status"] != "awaiting_ivr":
@@ -309,8 +471,11 @@ def ivr_confirm(conn, *, request_id: int, caller_phone: str, digit: str) -> dict
     if c["phone"] != caller_phone:
         raise ApiError(403, "Caller ID does not match the collector")
     status = "accepted" if digit == "1" else "rejected"
-    conn.execute("UPDATE sale_requests SET status=?, reject_reason=? WHERE id=?",
-                 (status, None if digit == "1" else "Collector declined on IVR", request_id))
+    # One keypress decides: a repeated or replayed IVR callback finds no awaiting_ivr row.
+    cur = conn.execute("UPDATE sale_requests SET status=?, reject_reason=? WHERE id=? AND status='awaiting_ivr'",
+                       (status, None if digit == "1" else "Collector declined on IVR", request_id))
+    if cur.rowcount == 0:
+        raise ApiError(409, f"Request is {get_request(conn, request_id)['status']}")
     return get_request(conn, request_id)
 
 

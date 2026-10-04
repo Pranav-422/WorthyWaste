@@ -42,6 +42,23 @@ DEALERS = [
     ("Gupta Scrap Traders", "Anil Gupta", "9811000002", *GUPTA, "SCALE-GUPTA-01", "guptascrap@ybl", 74),
 ]
 
+# Satin branch staff who review flags and disburse loans (name, phone, branch).
+SATIN_USERS = [
+    ("Priya Sharma", "9812000001", "Satin Creditcare · Narela branch"),
+]
+
+
+def ensure_satin_users(conn: Database) -> None:
+    """Databases seeded before the Satin login existed have no branch staff, so add the sample
+    account. Never touches a database that already has any."""
+    if conn.execute("SELECT COUNT(*) FROM satin_users").fetchone()[0]:
+        return
+    with transaction(conn):
+        for name, phone, branch in SATIN_USERS:
+            conn.execute(
+                "INSERT INTO satin_users (name, phone, pin_hash, branch, created_at) VALUES (?,?,?,?,?)",
+                (name, phone, auth.hash_pin(DEMO_PIN), branch, clock.ts()))
+
 
 def _wipe(conn):
     for t in reversed(TABLES):
@@ -108,6 +125,10 @@ def _build(conn: Database, wipe: bool) -> None:
                 (shop, owner, phone, auth.hash_pin(DEMO_PIN), lat, lng, scale_id, vpa, rep,
                  clock.ts(real_now - timedelta(days=300))))
             dids[shop.split()[0]] = cur.lastrowid
+        for name, phone, branch in SATIN_USERS:
+            conn.execute(
+                "INSERT INTO satin_users (name, phone, pin_hash, branch, created_at) VALUES (?,?,?,?,?)",
+                (name, phone, auth.hash_pin(DEMO_PIN), branch, clock.ts(real_now - timedelta(days=300))))
         dealer_vpa = {dids["Raju"]: DEALERS[0][6], dids["Gupta"]: DEALERS[1][6]}
         dealer_loc = {dids["Raju"]: RAJU, dids["Gupta"]: GUPTA}
         coll_vpa = {cids[c[0].split()[0]]: c[6] for c in COLLECTORS}

@@ -11,6 +11,9 @@ from . import clock, phash
 DUP_PHOTO_MAX_DISTANCE = 6
 DUP_PHOTO_WINDOW_DAYS = 30
 GPS_MAX_DISTANCE_M = 50
+# How far a collector may be from the shop they pick. Wider than GPS_MAX_DISTANCE_M on purpose: at
+# this point they are choosing where to walk to, not standing at the scale.
+DEALER_CHOICE_MAX_M = 5000
 WEIGHT_GAP_PCT = 0.10
 WEIGHT_GAP_REPEATS = 3
 WEIGHT_GAP_WINDOW_DAYS = 7
@@ -22,6 +25,9 @@ PAIR_FREQ_MIN_COLLECTORS = 5  # need a real pattern before calling a pair unusua
 MASS_BALANCE_WINDOW_DAYS = 30
 MASS_BALANCE_GAP = 0.15
 MASS_BALANCE_MIN_KG = 500  # too little volume and normal stock lag looks like a gap
+PHOTO_MATCH_CONFIDENCE = 0.80
+PHOTO_MISMATCH_REPEATS = 3
+PHOTO_MISMATCH_WINDOW_DAYS = 7
 
 
 class Blocked(Exception):
@@ -66,6 +72,76 @@ def find_duplicate_photo(conn, new_hash: str) -> dict | None:
             best = {"request_id": r["id"], "collector_id": r["collector_id"],
                     "distance": int(d), "created_at": r["created_at"]}
     return best
+
+
+# ---------- Photo vs selected material (at POST /requests, and again when the dealer confirms) ----------
+
+def photo_verdict(selected: str, check) -> dict:
+    """Turn a PhotoVerifier answer into one of four verdicts. An AI guess never blocks a sale on its
+    own: the worst it can do is 'mismatch', which warns the collector and is shown to the dealer."""
+    if not check.available:
+        return {"verdict": "unchecked", "material": None, "confidence": None, "real_scene": None,
+                "notes": check.notes}
+    seen, conf = check.material, check.confidence or 0.0
+    if seen == "not_scrap" or check.real_scene is False:
+        verdict = "mismatch"
+    elif conf < PHOTO_MATCH_CONFIDENCE or seen == "mixed":
+        # Not sure enough to say either way — includes a genuinely mixed load.
+        verdict = "uncertain"
+    elif seen == selected:
+        verdict = "match"
+    else:
+        verdict = "mismatch"
+    notes = check.notes
+    if check.approx_quantity:
+        notes = f"{notes} ({check.approx_quantity})" if notes else f"About {check.approx_quantity}"
+    return {"verdict": verdict, "material": seen, "confidence": round(conf, 2),
+            "real_scene": check.real_scene, "notes": notes}
+
+
+def count_photo_mismatches(conn, collector_id: int) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM sale_requests WHERE collector_id = ? AND ai_verdict = 'mismatch' "
+        "AND created_at >= ?",
+        (collector_id, clock.ago(days=PHOTO_MISMATCH_WINDOW_DAYS)),
+    ).fetchone()[0]
+
+
+def check_photo_mismatch(conn, req: dict) -> int | None:
+    """One mismatch is only recorded on the request. Three in a week is a pattern worth Satin's time,
+    so it becomes a holding flag (see score.HOLDING_RULES)."""
+    repeats = count_photo_mismatches(conn, req["collector_id"])
+    if repeats < PHOTO_MISMATCH_REPEATS:
+        return None
+    return raise_flag(
+        conn, entity_type="collector", entity_id=req["collector_id"], rule="photo_mismatch",
+        detail=f"Photo did not match the material chosen on {repeats} sales in "
+               f"{PHOTO_MISMATCH_WINDOW_DAYS} days (latest: chose {req['material']}, "
+               f"photo looked like {req['ai_material'] or 'something else'})",
+        evidence={"repeats": repeats, "request_id": req["id"], "chose": req["material"],
+                  "ai_material": req["ai_material"], "ai_confidence": req["ai_confidence"],
+                  "ai_verdict": req["ai_verdict"], "ai_notes": req["ai_notes"],
+                  "ai_real_scene": req["ai_real_scene"], "photo_url": req["photo_url"]},
+        collector_id=req["collector_id"], dedupe_hours=24,
+    )
+
+
+def check_material_override(conn, req: dict, dealer_material: str) -> int | None:
+    """The dealer had the scrap in their hands and confirmed a different material than the collector
+    chose. That is a human saying the listing was wrong, so it flags on the first occurrence."""
+    if dealer_material == req["material"]:
+        return None
+    return raise_flag(
+        # Flagged against the request, so each disputed sale gets its own card for Satin.
+        conn, entity_type="request", entity_id=req["id"], rule="photo_mismatch",
+        detail=f"Dealer weighed this load as {dealer_material}, not the {req['material']} the "
+               f"collector chose (request #{req['id']})",
+        evidence={"request_id": req["id"], "chose": req["material"], "dealer_material": dealer_material,
+                  "ai_material": req["ai_material"], "ai_confidence": req["ai_confidence"],
+                  "ai_verdict": req["ai_verdict"], "ai_notes": req["ai_notes"],
+                  "ai_real_scene": req["ai_real_scene"], "photo_url": req["photo_url"]},
+        collector_id=req["collector_id"], dealer_id=req["dealer_id"],
+    )
 
 
 # ---------- Location (at /accept) ----------
@@ -253,4 +329,5 @@ RULE_LABELS = {
     "circular_payment": "Circular payment",
     "pair_frequency": "Pair frequency",
     "mass_balance": "Mass balance",
+    "photo_mismatch": "Photo mismatch",
 }

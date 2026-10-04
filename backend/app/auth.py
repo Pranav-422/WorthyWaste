@@ -1,8 +1,8 @@
-"""Phone + PIN login for collectors and dealers.
+"""Phone + PIN login for collectors, dealers and Satin branch staff.
 
-Sessions are stateless signed tokens kept in an httpOnly cookie per role (ww_collector, ww_dealer), so a
-collector and a dealer can be signed in side by side on the demo stage. The Next.js server verifies the
-same tokens (frontend/lib/session.ts), so both must share WW_SECRET.
+Sessions are stateless signed tokens kept in an httpOnly cookie per role (ww_collector, ww_dealer,
+ww_satin), so a collector, a dealer and the lender can be signed in side by side on the demo stage.
+The Next.js server verifies the same tokens (frontend/lib/session.ts), so both must share WW_SECRET.
 
 Token: base64url(JSON {"r": role, "id": id, "exp": unix}) + "." + base64url(HMAC-SHA256(secret, payload))
 """
@@ -14,7 +14,7 @@ import os
 import secrets
 import time
 
-ROLES = ("collector", "dealer")
+ROLES = ("collector", "dealer", "satin")
 SESSION_DAYS = 7
 PBKDF2_ROUNDS = 120_000
 DEV_SECRET = "worthywaste-dev-secret-change-me"
@@ -106,3 +106,53 @@ def record_failure(key: str) -> None:
 
 def clear_failures(key: str) -> None:
     _attempts.pop(key, None)
+
+
+# ---------- Provider webhook signatures ----------
+# Payment and IVR providers sign the raw request body with a shared secret
+# (X-Provider-Signature: hex HMAC-SHA256). Without WW_PROVIDER_SECRET nothing can be verified, so
+# every signed route refuses — a missing secret must not mean "open".
+
+PROVIDER_SIGNATURE_HEADER = "x-provider-signature"
+
+
+def provider_secret() -> bytes | None:
+    s = os.environ.get("WW_PROVIDER_SECRET")
+    return s.encode() if s else None
+
+
+def sign_provider_body(body: bytes, secret: bytes | None = None) -> str:
+    key = secret if secret is not None else provider_secret()
+    if not key:
+        raise RuntimeError("WW_PROVIDER_SECRET is not set")
+    return hmac.new(key, body, hashlib.sha256).hexdigest()
+
+
+def verify_provider_signature(body: bytes, header: str | None) -> bool:
+    key = provider_secret()
+    if not key or not header:
+        return False
+    # Accept a bare hex digest or the common "sha256=<hex>" form.
+    got = header.strip()
+    if got.lower().startswith("sha256="):
+        got = got[7:]
+    return hmac.compare_digest(got.lower(), hmac.new(key, body, hashlib.sha256).hexdigest())
+
+
+# ---------- Demo reset key ----------
+
+def demo_reset_allowed() -> bool:
+    """POST /api/demo/reset wipes everything, so it stays off unless deliberately switched on."""
+    return os.environ.get("WW_ALLOW_RESET") == "1"
+
+
+def demo_key_ok(header: str | None) -> bool:
+    want = os.environ.get("WW_DEMO_KEY")
+    if not want or not header:
+        return False
+    return hmac.compare_digest(header, want)
+
+
+def demo_mode() -> bool:
+    """Demo shortcuts (simulated scan, over-estimated load, fixed location) exist only when this is on."""
+    return os.environ.get("WW_DEMO_MODE") == "1"

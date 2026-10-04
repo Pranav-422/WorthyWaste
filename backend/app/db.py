@@ -13,7 +13,7 @@ DB_PATH = Path(os.environ.get("WW_DB", DATA_DIR / "worthywaste.db"))
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 
 # Tables in dependency order (referenced tables first). Used for schema, wipe and copy.
-TABLES = ["groups", "collectors", "dealers", "materials", "sale_requests", "photos", "payments",
+TABLES = ["groups", "collectors", "dealers", "satin_users", "materials", "sale_requests", "photos", "payments",
           "upi_events", "recycler_sales", "batches", "transactions", "scores", "loans", "fraud_flags",
           "messages"]
 
@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS dealers (
   created_at  TEXT NOT NULL
 );
 
+-- Satin branch staff. Same phone + PIN + signed-cookie login as collectors and dealers, but a
+-- separate table: these are the lender's employees, not people on the platform.
+CREATE TABLE IF NOT EXISTS satin_users (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  phone      TEXT NOT NULL UNIQUE,
+  pin_hash   TEXT,
+  branch     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS materials (
   code         TEXT PRIMARY KEY,
   sort_order   INTEGER NOT NULL,
@@ -79,12 +90,19 @@ CREATE TABLE IF NOT EXISTS sale_requests (
   lng           REAL,
   channel       TEXT NOT NULL DEFAULT 'app',     -- app | ivr
   status        TEXT NOT NULL DEFAULT 'open',
-    -- open, accepted, weighed, paying, completed, expired, rejected, awaiting_ivr
+    -- open, accepted, weighed, paying, completed, expired, rejected, cancelled, awaiting_ivr
   dealer_lat    REAL,
   dealer_lng    REAL,
   gps_distance_m REAL,
   scale_kg      REAL,
   scale_source  TEXT,
+  -- Photo check (adapters.PhotoVerifier): what the AI saw, and what the dealer confirmed at the scale.
+  ai_material   TEXT,
+  ai_confidence REAL,
+  ai_verdict    TEXT,               -- match | mismatch | uncertain | unchecked
+  ai_notes      TEXT,
+  ai_real_scene INTEGER,            -- 0 when the photo looks like a screen or printout
+  dealer_material TEXT REFERENCES materials(code),
   reject_reason TEXT,
   created_at    TEXT NOT NULL,
   expires_at    TEXT NOT NULL
@@ -202,7 +220,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_tx_collector ON transactions(collector_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tx_dealer ON transactions(dealer_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_req_status ON sale_requests(status);
+CREATE INDEX IF NOT EXISTS idx_req_dealer ON sale_requests(dealer_id, status);
 CREATE INDEX IF NOT EXISTS idx_upi_from ON upi_events(from_vpa, at);
+CREATE INDEX IF NOT EXISTS idx_req_collector ON sale_requests(collector_id, created_at);
 """
 
 # Columns added after the first release; created on older databases at startup.
@@ -211,6 +231,12 @@ MIGRATIONS = [
     ("collectors", "pin_hash", "TEXT"),
     ("dealers", "pin_hash", "TEXT"),
     ("materials", "sort_order", "INTEGER"),
+    ("sale_requests", "ai_material", "TEXT"),
+    ("sale_requests", "ai_confidence", "REAL"),
+    ("sale_requests", "ai_verdict", "TEXT"),
+    ("sale_requests", "ai_notes", "TEXT"),
+    ("sale_requests", "ai_real_scene", "INTEGER"),
+    ("sale_requests", "dealer_material", "TEXT"),
 ]
 
 MATERIALS = [
@@ -277,8 +303,8 @@ class Cursor:
 
 
 _INSERT_TABLE = re.compile(r"^\s*INSERT\s+INTO\s+(\w+)", re.IGNORECASE)
-_ID_TABLES = {"groups", "collectors", "dealers", "sale_requests", "payments", "upi_events", "recycler_sales",
-              "batches", "transactions", "loans", "fraud_flags", "messages"}
+_ID_TABLES = {"groups", "collectors", "dealers", "satin_users", "sale_requests", "payments", "upi_events",
+              "recycler_sales", "batches", "transactions", "loans", "fraud_flags", "messages"}
 
 
 class Database:
@@ -373,7 +399,7 @@ def init_db(db: Database) -> None:
     db.executescript(_pg_schema(SCHEMA) if db.is_pg else SCHEMA)
     for table, column, kind in MIGRATIONS:
         if column not in db.columns(table):
-            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {_pg_schema(kind) if db.is_pg else kind}")
     db.executemany(
         "INSERT INTO materials (code, sort_order, label_en, label_hi, rate_per_kg, co2e_per_kg) "
         "VALUES (?,?,?,?,?,?) ON CONFLICT (code) DO UPDATE SET sort_order = excluded.sort_order, "

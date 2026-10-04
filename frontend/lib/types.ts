@@ -14,7 +14,11 @@ export type RequestStatus =
   | "completed"
   | "expired"
   | "rejected"
+  | "cancelled"
   | "awaiting_ivr";
+
+/** "unchecked" means the verifier was unavailable, never that the photo looked wrong. */
+export type AiVerdict = "match" | "mismatch" | "uncertain" | "unchecked";
 
 export type SaleRequest = {
   id: number;
@@ -29,6 +33,14 @@ export type SaleRequest = {
   status: RequestStatus;
   gps_distance_m: number | null;
   scale_kg: number | null;
+  /** Photo check (backend/app/adapters.py PhotoVerifier). */
+  ai_material: string | null;
+  ai_confidence: number | null;
+  ai_verdict: AiVerdict | null;
+  ai_notes: string | null;
+  ai_real_scene: number | null;
+  /** What the dealer confirmed at the scale; this is what was paid for and traced. */
+  dealer_material: string | null;
   created_at: string;
   expires_at: string;
   // queue extras
@@ -37,6 +49,18 @@ export type SaleRequest = {
   rate_per_kg?: number;
   distance_m?: number;
   basic_phone?: number;
+};
+
+/** Evidence on a 409 from POST /requests with rule "photo_mismatch". */
+export type PhotoMismatch = {
+  chose: string;
+  chose_label_hi: string;
+  chose_label_en: string;
+  verdict: AiVerdict;
+  material: string | null;
+  confidence: number | null;
+  real_scene: boolean | null;
+  notes: string | null;
 };
 
 export type Transaction = {
@@ -161,6 +185,35 @@ export type Dealer = {
 };
 
 export type MassBalance = { bought_kg: number; sold_kg: number; gap_pct: number | null };
+
+/** A shop the collector can pick, from GET /dealers/nearby. Never carries contact details. */
+export type NearbyDealer = {
+  id: number;
+  shop_name: string;
+  distance_m: number;
+  last_used: boolean;
+};
+
+/** One of the collector's own sales, from GET /collectors/me/requests. */
+export type MyRequest = {
+  id: number;
+  material: string;
+  est_kg: number;
+  scale_kg: number | null;
+  status: RequestStatus;
+  created_at: string;
+  expires_at: string;
+  dealer_material: string | null;
+  ai_verdict: AiVerdict | null;
+  ai_material: string | null;
+  photo_url: string | null;
+  shop_name: string | null;
+  label_en: string;
+  label_hi: string;
+  /** Set once the sale is paid. */
+  amount: number | null;
+  credits: number | null;
+};
 
 export type Batch = {
   id: number;

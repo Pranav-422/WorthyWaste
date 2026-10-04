@@ -29,3 +29,8 @@ export function mmss(ms: number) {
 }
 
 export const tonnes = (kgVal: number) => `${(kgVal / 1000).toFixed(2)} t`;
+
+/** A walking distance a collector can judge: "250 m", "1.4 km". */
+export function metres(m: number): string {
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+}
