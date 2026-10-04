@@ -14,7 +14,10 @@ GPS_MAX_DISTANCE_M = 50
 # How far a collector may be from the shop they pick. Wider than GPS_MAX_DISTANCE_M on purpose: at
 # this point they are choosing where to walk to, not standing at the scale.
 DEALER_CHOICE_MAX_M = 5000
-SHOP_LOCATION_MAX_ACCURACY_M = 100  # a shop pinned from a worse GPS fix could land on the wrong street
+# The shop pin only decides which shops a collector sees within DEALER_CHOICE_MAX_M (5 km). The 50 m
+# "standing together" check uses both phones' live GPS at accept time, not this pin. So a coarse fix is
+# fine here; a laptop's Wi-Fi location (often ±150–300 m) has to be accepted.
+SHOP_LOCATION_MAX_ACCURACY_M = 1000
 WEIGHT_GAP_PCT = 0.10
 WEIGHT_GAP_REPEATS = 3
 WEIGHT_GAP_WINDOW_DAYS = 7

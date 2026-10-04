@@ -29,7 +29,9 @@ def test_a_coarse_or_empty_gps_fix_is_refused(client):
     reset(client)
     with TestClient(main.app) as gupta:
         login(gupta, "dealer", "9811000002")
-        r = gupta.post("/api/dealers/me/location", json={**FAR, "accuracy_m": 450})
+        # A laptop's Wi-Fi fix (±167 m) is fine for a 5 km shop list; only a very coarse one is refused.
+        assert gupta.post("/api/dealers/me/location", json={**FAR, "accuracy_m": 167}).status_code == 200
+        r = gupta.post("/api/dealers/me/location", json={**FAR, "accuracy_m": 2500})
         assert r.status_code == 400 and r.json()["rule"] == "gps_inaccurate"
         assert gupta.post("/api/dealers/me/location", json={"lat": 0, "lng": 0}).status_code == 400
         assert gupta.post("/api/dealers/me/location", json={"lat": 123, "lng": 0}).status_code == 422
