@@ -58,6 +58,15 @@ Satin session: `/flags`, `/flags/{id}`, `/loans`, `/groups`, `/satin/overview`, 
 what serving the person in front of them needs. That is also why the demo's "simulate scan" runs on the server
 (`POST /api/demo/requests/{id}/simulate-scan`): the QR token the scan would read never leaves the backend.
 
+**A sale is between one collector and one dealer.** The collector picks the shop when they raise the request —
+`GET /api/dealers/nearby` lists registered shops within 5 km, nearest first, with the one they sold to last
+preselected, carrying only a name and a distance. The request is stored against that shop, so it appears in that
+dealer's queue and nowhere else; every other dealer gets **404** from `/requests/{id}`, accept, weigh and
+approve, because 403 would confirm the sale exists. The collector follows their own side at
+`GET /api/collectors/me/requests` and can withdraw a request with `POST /api/requests/{id}/cancel` while it is
+still open. Satin sees a collector's completed sales — what scores, flags and loans are built from — but not
+ones still in flight.
+
 `WW_SCRIPTED=1` makes the simulated scale read est × 0.978, so 28 kg always becomes 27.4 kg and every take matches the script.
 
 **Demo shortcuts** — the dealer's simulated scan, over-estimated load and location menu, and the collector's
@@ -72,8 +81,10 @@ page hides. Without the shortcuts the collector app sends real GPS and says so p
 
 ## Demo click path (Design Doc)
 
-1. Collector: *नई बिक्री* → plastic → 28 kg → take photo → *भेजें*.
+1. Collector: *नई बिक्री* → shop *Raju Kabadi Store · 0 m दूर · पिछली बार यहीं* (preselected) → plastic
+   → 28 kg → take photo → *भेजें*.
 2. Dealer: tap Meena's request → scan her QR (or *Demo: simulate a successful scan*) → "Location matched".
+   Her waiting screen ticks *भेजा → स्वीकार → तौला → पैसा मिला* as he goes.
 3. Dealer: *Weigh* → 27.4 kg vs 28 kg estimate, within 10%.
 4. Dealer: confirm the material (pre-selected: *Plastic bottles*, the collector's choice) → *Approve and pay ₹340*
    → mock UPI succeeds after 1 s.
@@ -102,7 +113,21 @@ said it shows, so a second check reads the photo itself.
 including its GPS tags, is dropped from both what we send and what we store — and asks a `PhotoVerifier`
 (`backend/app/adapters.py`) for strict JSON: `material`, `confidence` 0–1, `real_scene`, `approx_quantity`,
 `notes`. `GeminiPhotoVerifier` calls Google's Gemini API over plain REST when `GEMINI_API_KEY` is set;
-without a key the mock answers "unavailable", which is also what every test gets. Timeout ~8 s.
+without a key the mock answers "unavailable", which is also what every test gets.
+
+The model is sent a 512 px copy at quality 80 — enough to tell cardboard from plastic, and much faster than the
+768 px copy the dealer sees. Each attempt gets 15 s, a 429, a 503 or a dropped connection buys one retry after
+~1 s, and the whole check is bounded at 20 s so a slow model can never push the request towards the 60 s
+function limit. A 400 is not retried; it would only fail again.
+
+**A failing photo check must not look like a passing one.** Every failure logs the model, the HTTP code,
+Google's own `error.status` and the latency — never the key, never the image — and the last one is kept in
+memory and shown on `/api/health`:
+
+```json
+{ "photo_check": "GeminiPhotoVerifier", "photo_check_model": "gemini-3.5-flash-lite",
+  "photo_check_last_ms": 4820, "photo_check_last_error": null }
+```
 
 | Verdict | When | What happens |
 | --- | --- | --- |
@@ -173,7 +198,7 @@ Nothing here has a permissive default: a missing secret always means "refuse", n
 | `DATABASE_URL` | api | Postgres (Neon on Vercel); `POSTGRES_URL` also accepted | Falls back to local SQLite |
 | `WW_SCRIPTED` | api | Scripted scale (28 kg → 27.4 kg), so every take matches | Random reading near the estimate |
 | `GEMINI_API_KEY` | api | Turns on the real photo check | Every photo comes back `unchecked` |
-| `GEMINI_MODEL` | api | Model id for the photo check | Defaults to `gemini-3.5-flash` |
+| `GEMINI_MODEL` | api | Model id for the photo check | Defaults to `gemini-3.5-flash-lite` |
 | `WW_PROVIDER_SECRET` | api | HMAC key for `X-Provider-Signature` on `/payments/webhook`, `/upi/observed`, `/ivr/confirm` | Those three endpoints refuse every call (401) |
 | `WW_DEMO_MODE` | api + web | Lets the demo shortcuts exist, when the URL also says `?demo=1` | No shortcuts; real GPS and the real photo check |
 | `WW_ALLOW_RESET` | api + web | Allows `POST /api/demo/reset` at all | Reset answers 403 |
@@ -199,6 +224,9 @@ unset, so no test calls the network.
 | `test_photo_check.py` | Each verdict; "send anyway" records without blocking; a timeout or a crashing verifier leaves a sale `unchecked` rather than refused; 3 mismatches in 7 days hold the loan; a dealer override changes the material, the amount, the batch and what Satin sees |
 | `test_security.py` | Reset without the key; Satin endpoints without a Satin session; provider endpoints without a signature; each demo shortcut with `WW_DEMO_MODE` off |
 | `test_concurrency.py` | Double accept, double approve, a replayed webhook, a repeated IVR keypress, and the conditional updates themselves |
+| `test_private_sale.py` | Picking a shop within 5 km; that another dealer gets 404 from every route for a sale that is not theirs; each queue holding only its own; the collector's status list through to paid; cancel; what Satin does and does not see |
+| `test_photo_reliability.py` | The photo check against a fake HTTP layer: a retried rate limit, two timeouts becoming "unchecked" with the reason on `/api/health`, the 512 px image, the configured model id, and that health never carries the key |
+| `test_review_fixes.py` | The setup lock is released, the photo check runs outside the lock and the transaction, and Satin staff are backfilled on an older database |
 
 The same tests run against Postgres when `DATABASE_URL` is set. Without installing Postgres, PGlite works:
 
@@ -233,7 +261,7 @@ and routes `/api/*` to the API and everything else to the web app, on one domain
    | `WW_ALLOW_RESET` | `1` for the demo, unset otherwise | Allows reset at all; with `WW_DEMO_KEY` it also puts the button in the Satin sidebar |
    | `WW_DEMO_MODE` | `1` for the recording, unset otherwise | Lets the demo shortcuts exist on URLs that ask with `?demo=1` |
    | `GEMINI_API_KEY` | from Google AI Studio | Turns on the photo check. Without it photos come back `unchecked` and nothing breaks. |
-   | `GEMINI_MODEL` | optional, e.g. `gemini-3.5-flash` | Overrides the default model id |
+   | `GEMINI_MODEL` | optional, e.g. `gemini-3.5-flash` | Overrides the default `gemini-3.5-flash-lite` |
 
    `WW_SECRET`, `WW_DEMO_MODE`, `WW_ALLOW_RESET` and `WW_DEMO_KEY` are read by **both** services, so add them
    without restricting them to one. `GEMINI_*` and `WW_PROVIDER_SECRET` are only read by the API.
