@@ -50,8 +50,11 @@ function AiBadge({ req, materials, className = "" }: { req: SaleRequest; materia
       : verdict === "uncertain"
         ? "bg-marigold-soft text-ink"
         : "bg-leaf-soft text-leaf-dark";
+  // Set by the collector app's demo-only "fake the AI answer" control, never by the real model.
+  const scripted = req.ai_notes?.startsWith("Scripted demo") ?? false;
   const text =
-    req.ai_real_scene === 0
+    (scripted ? "DEMO · " : "") +
+    (req.ai_real_scene === 0
       ? "AI: looks like a photo of a screen"
       : verdict === "mismatch"
         ? req.ai_material === "not_scrap"
@@ -59,9 +62,14 @@ function AiBadge({ req, materials, className = "" }: { req: SaleRequest; materia
           : `AI: looks like ${label}${pct ? ` (${pct})` : ""}`
         : verdict === "uncertain"
           ? `AI: not sure${label && req.ai_material !== "mixed" ? ` — maybe ${label}` : ", looks mixed"}`
-          : `AI: matches ${label}${pct ? ` (${pct})` : ""}`;
+          : `AI: matches ${label}${pct ? ` (${pct})` : ""}`);
   return (
-    <span className={`inline-block rounded-lg px-2 py-0.5 text-xs font-semibold ${tone} ${className}`}>{text}</span>
+    <span
+      title={scripted ? "Faked with the demo control, not checked by the AI" : undefined}
+      className={`inline-block rounded-lg px-2 py-0.5 text-xs font-semibold ${tone} ${scripted ? "border border-dashed border-current" : ""} ${className}`}
+    >
+      {text}
+    </span>
   );
 }
 
