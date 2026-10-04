@@ -50,8 +50,11 @@ function AiBadge({ req, materials, className = "" }: { req: SaleRequest; materia
       : verdict === "uncertain"
         ? "bg-marigold-soft text-ink"
         : "bg-leaf-soft text-leaf-dark";
+  // Set by the collector app's demo-only "fake the AI answer" control, never by the real model.
+  const scripted = req.ai_notes?.startsWith("Scripted demo") ?? false;
   const text =
-    req.ai_real_scene === 0
+    (scripted ? "DEMO · " : "") +
+    (req.ai_real_scene === 0
       ? "AI: looks like a photo of a screen"
       : verdict === "mismatch"
         ? req.ai_material === "not_scrap"
@@ -59,9 +62,14 @@ function AiBadge({ req, materials, className = "" }: { req: SaleRequest; materia
           : `AI: looks like ${label}${pct ? ` (${pct})` : ""}`
         : verdict === "uncertain"
           ? `AI: not sure${label && req.ai_material !== "mixed" ? ` — maybe ${label}` : ", looks mixed"}`
-          : `AI: matches ${label}${pct ? ` (${pct})` : ""}`;
+          : `AI: matches ${label}${pct ? ` (${pct})` : ""}`);
   return (
-    <span className={`inline-block rounded-lg px-2 py-0.5 text-xs font-semibold ${tone} ${className}`}>{text}</span>
+    <span
+      title={scripted ? "Faked with the demo control, not checked by the AI" : undefined}
+      className={`inline-block rounded-lg px-2 py-0.5 text-xs font-semibold ${tone} ${scripted ? "border border-dashed border-current" : ""} ${className}`}
+    >
+      {text}
+    </span>
   );
 }
 
@@ -136,6 +144,7 @@ export function DealerApp({ dealerId, demo }: { dealerId: number; demo: boolean 
         ) : (
           <>
             <main className="flex-1 px-4 py-4">
+              {tab === "queue" && <ShopLocation dealer={d} locMode={locMode} onSaved={loadProfile} />}
               {tab === "queue" && (
                 <Queue
                   queue={queue}
@@ -897,3 +906,60 @@ function Sell({ profile, onDone }: { profile: DealerProfile; onDone: () => void 
     </div>
   );
 }
+
+// ---------- Shop location ----------
+
+/** Collectors pick a shop from those near them, measured from this pin. The dealer sets it standing at
+ *  the shop; until then, collectors nearby will not see the shop in their list. */
+function ShopLocation({ dealer, locMode, onSaved }: { dealer: Dealer; locMode: "demo" | "far" | "gps"; onSaved: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const set = dealer.location_set_at;
+
+  async function pin() {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const loc = await getLocation(locMode);
+      await post("/dealers/me/location", { lat: loc.lat, lng: loc.lng, accuracy_m: loc.accuracy ?? undefined });
+      setMsg({ ok: true, text: `Shop location saved${loc.accuracy ? ` (±${Math.round(loc.accuracy)} m)` : ""}. Collectors within 5 km can now pick your shop.` });
+      onSaved();
+    } catch (e) {
+      const text =
+        e instanceof LocationError
+          ? e.reason === "denied"
+            ? "Location is blocked. Allow this site to use your location in the browser settings, then try again."
+            : "Could not get a GPS fix. Step outside with a clear view of the sky and try again."
+          : (e as ApiError).message;
+      setMsg({ ok: false, text });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className={`mb-4 rounded-2xl border p-4 ${set ? "border-line bg-white" : "border-marigold bg-marigold-soft"}`}>
+      <p className="font-semibold">
+        📍 Shop location <span className="font-normal text-slate">· दुकान की जगह</span>
+      </p>
+      <p className="mt-1 text-sm text-slate">
+        {set
+          ? `Set ${timeAgo(set)}. Collectors within 5 km see your shop when they sell.`
+          : "Not set yet. Collectors near you cannot pick your shop until you set it. Stand at your shop and tap below."}
+      </p>
+      <button
+        onClick={pin}
+        disabled={busy}
+        className={`mt-3 h-11 w-full rounded-xl font-semibold disabled:opacity-50 ${set ? "border border-line bg-paper" : "bg-leaf text-white"}`}
+      >
+        {busy ? "Getting GPS…" : set ? "Update — I'm at my shop" : "Set my shop location here"}
+      </button>
+      {msg && (
+        <p role="status" className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? "bg-leaf-soft text-leaf-dark" : "bg-brick-soft text-brick"}`}>
+          {msg.text}
+        </p>
+      )}
+    </section>
+  );
+}
+

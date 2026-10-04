@@ -85,7 +85,7 @@ page hides. Without the shortcuts the collector app sends real GPS and says so p
    → 28 kg → take photo → *भेजें*.
    With GEMINI_API_KEY set the photo check is real: photograph actual plastic bottles. A photo of a screen,
    a printout or a laptop's test camera is (correctly) flagged as not a real scene. If you are recording
-   without real scrap to hand, pick *Demo: photo check sees* → `plastic` before taking the photo.
+   without real scrap to hand, pick *Demo: fake the AI answer* → `plastic` before taking the photo.
 2. Dealer: tap Meena's request → scan her QR (or *Demo: simulate a successful scan*) → "Location matched".
    Her waiting screen ticks *भेजा → स्वीकार → तौला → पैसा मिला* as he goes.
 3. Dealer: *Weigh* → 27.4 kg vs 28 kg estimate, within 10%.
@@ -93,7 +93,7 @@ page hides. Without the shortcuts the collector app sends real GPS and says so p
    → mock UPI succeeds after 1 s.
 5. Collector: marigold "₹340 मिले · 27.4 kg" with voice.
 6. Fraud 1: collector → *नई बिक्री* → *Demo: resend the previous photo* → "यह फ़ोटो पहले इस्तेमाल हो चुकी है".
-7. Fraud 2: collector → *नई बिक्री* → plastic → *Demo: photo check sees* → `cardboard` → take a photo → *भेजें*
+7. Fraud 2: collector → *नई बिक्री* → plastic → *Demo: fake the AI answer* → `cardboard` → take a photo → *भेजें*
    → "ये गत्ता लग रहा है — सही चुनें या फिर से फ़ोटो लें", spoken, with *Change material* and *Send anyway*.
 8. Fraud 3: Satin → Fraud flags → "Circular payment: ₹340 returned to Gupta Scrap Traders within 2 h…".
 9. Satin → Collectors → Meena → score **642**, five inputs shown → *Starter loan unlocked · ₹5,000*.

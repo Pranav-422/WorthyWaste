@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS dealers (
   scale_id    TEXT,
   upi_vpa     TEXT,
   reputation  INTEGER NOT NULL DEFAULT 80,
+  location_set_at TEXT,             -- when the dealer last set the shop's location from their phone
   created_at  TEXT NOT NULL
 );
 
@@ -231,6 +232,7 @@ MIGRATIONS = [
     ("collectors", "pin_hash", "TEXT"),
     ("dealers", "pin_hash", "TEXT"),
     ("materials", "sort_order", "INTEGER"),
+    ("dealers", "location_set_at", "TEXT"),
     ("sale_requests", "ai_material", "TEXT"),
     ("sale_requests", "ai_confidence", "REAL"),
     ("sale_requests", "ai_verdict", "TEXT"),

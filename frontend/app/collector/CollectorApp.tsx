@@ -617,14 +617,14 @@ function NewSale({
               </button>
             )}
             <label className="flex items-center justify-center gap-2 text-xs text-slate">
-              Demo: photo check sees
+              Demo: fake the AI answer
               <select
                 value={demoAi}
                 onChange={(e) => setDemoAi(e.target.value)}
                 className="rounded-lg border border-line bg-paper px-2 py-1"
                 aria-label="Demo photo check result"
               >
-                <option value="">the real answer</option>
+                <option value="">off — real AI</option>
                 {mismatchMaterials.map((m) => (
                   <option key={m} value={m}>
                     {m}
@@ -855,6 +855,11 @@ function Waiting({
       )}
       <h2 className="text-2xl font-semibold">{t(lang, "showQr")}</h2>
       <QrCode value={qr} size={220} className="rounded-2xl bg-white p-3 shadow" />
+      {/* For a dealer whose camera can't read the QR (or a laptop): they type this instead. */}
+      <p className="-mt-2 text-xs text-slate">
+        {lang === "hi" ? "QR न पढ़ पाए तो डीलर ये कोड लिखें" : "If the QR won't scan, the dealer types this code"}
+        <span className="mt-1 block font-mono text-2xl font-bold tracking-widest text-ink">{qr}</span>
+      </p>
       {status === "open" && (
         <p className="text-slate">
           {t(lang, "expiresIn")} <b className="font-display text-2xl text-ink tabular">{mmss(left)}</b>

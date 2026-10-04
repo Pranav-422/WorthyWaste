@@ -383,6 +383,19 @@ def dealers_nearby(lat: float, lng: float, me_id: int = Depends(require_collecto
     return services.nearby_dealers(conn, me_id, lat, lng)
 
 
+class ShopLocationBody(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    # The phone's reported GPS accuracy, in metres. Too coarse a fix is refused.
+    accuracy_m: float | None = Field(None, ge=0)
+
+
+@api.post("/dealers/me/location")
+def set_shop_location(body: ShopLocationBody, me_id: int = Depends(require_dealer), conn=Depends(db)):
+    """A dealer pins their shop where they are standing, so nearby collectors can pick it."""
+    return services.set_shop_location(conn, me_id, body.lat, body.lng, body.accuracy_m)
+
+
 @api.get("/dealers/{dealer_id}")
 def dealer_profile(dealer_id: int, me_id: int = Depends(require_dealer), conn=Depends(db)):
     _same(me_id, dealer_id, "dealer")

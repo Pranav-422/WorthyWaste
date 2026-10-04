@@ -53,6 +53,20 @@ def dealer_request(conn, request_id: int, dealer_id: int) -> dict:
     return req
 
 
+def set_shop_location(conn, dealer_id: int, lat: float, lng: float, accuracy_m: float | None) -> dict:
+    """The dealer pins their shop from their phone, standing at the shop. This is what collectors'
+    "nearby shops" list is measured from."""
+    if accuracy_m is not None and accuracy_m > fraud.SHOP_LOCATION_MAX_ACCURACY_M:
+        raise ApiError(400, f"GPS is only accurate to about {accuracy_m:,.0f} m. Stand at the shop with a clear "
+                            f"view of the sky and try again.", rule="gps_inaccurate",
+                       evidence={"accuracy_m": round(accuracy_m)})
+    if abs(lat) < 0.0001 and abs(lng) < 0.0001:
+        raise ApiError(400, "That location looks empty (0, 0). Turn on GPS and try again.")
+    now = clock.ts()
+    conn.execute("UPDATE dealers SET lat = ?, lng = ?, location_set_at = ? WHERE id = ?", (lat, lng, now, dealer_id))
+    return {"lat": lat, "lng": lng, "location_set_at": now}
+
+
 def nearby_dealers(conn, collector_id: int, lat: float, lng: float) -> list[dict]:
     """Shops the collector could walk to, nearest first. Shop name and distance only: a collector
     picking a shop has no business knowing its phone number or where its money goes."""

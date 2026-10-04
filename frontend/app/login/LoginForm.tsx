@@ -10,22 +10,6 @@ type Role = "collector" | "dealer" | "satin";
 
 const ROLES: Role[] = ["collector", "dealer", "satin"];
 
-// Seeded sample accounts (backend/app/seed.py, PIN 1234).
-const DEMO: Record<Role, { name: string; phone: string; note: string }[]> = {
-  collector: [
-    { name: "Meena Devi", phone: "9810000001", note: "Demo hero · score 642 after a sale" },
-    { name: "Sunita Kumari", phone: "9810000002", note: "New · loan unlocks in 11 sales" },
-    { name: "Lakshmi Bai", phone: "9810000003", note: "Repaid first loan" },
-  ],
-  dealer: [
-    { name: "Raju Kabadi Store", phone: "9811000001", note: "Demo dealer · balanced books" },
-    { name: "Gupta Scrap Traders", phone: "9811000002", note: "Has a mass-balance flag" },
-  ],
-  satin: [
-    { name: "Priya Sharma", phone: "9812000001", note: "Branch manager · Narela" },
-  ],
-};
-
 const COPY = {
   collector: { tab: "Collector", tabHi: "कबाड़ बेचने वाले", title: "नमस्ते! लॉग इन करें", sub: "Log in to sell scrap and see your score" },
   dealer: { tab: "Dealer", tabHi: "कबाड़ी दुकान", title: "Dealer login", sub: "Scan, weigh and pay collectors by UPI" },
@@ -143,32 +127,6 @@ export function LoginForm({ initialRole }: { initialRole: Role }) {
           </button>
         </form>
       </div>
-
-      <section className="mt-5 w-full max-w-md rounded-3xl border border-dashed border-line bg-paper/70 p-5">
-        <p className="text-sm font-semibold">Sample accounts · PIN 1234</p>
-        <p className="text-xs text-slate">Demo data only. Tap one to log in.</p>
-        <ul className="mt-3 space-y-2">
-          {DEMO[role].map((a) => (
-            <li key={a.phone}>
-              <button
-                disabled={busy}
-                onClick={() => {
-                  setPhone(a.phone);
-                  setPin("1234");
-                  submit(undefined, a.phone, "1234");
-                }}
-                className="flex w-full items-center justify-between gap-3 rounded-2xl border border-line bg-white px-4 py-3 text-left hover:border-leaf"
-              >
-                <span>
-                  <span className="block font-semibold">{a.name}</span>
-                  <span className="block text-xs text-slate">{a.note}</span>
-                </span>
-                <span className="font-mono text-sm text-slate">{a.phone}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      </section>
 
       <p className="mt-6 max-w-md text-center text-xs text-slate">
         Each role has its own session, so a collector, a dealer and Satin can be signed in side by side
