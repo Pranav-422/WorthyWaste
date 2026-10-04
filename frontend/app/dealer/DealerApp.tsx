@@ -193,7 +193,9 @@ function Queue({
   return (
     <div className="space-y-3">
       {queue.length === 0 && (
-        <div className="rounded-2xl border border-dashed border-line p-8 text-center text-slate">No open requests nearby. New ones appear here.</div>
+        <div className="rounded-2xl border border-dashed border-line p-8 text-center text-slate">
+          No requests yet. A collector picks your shop and their request appears here.
+        </div>
       )}
       {queue.map((r) => (
         <button

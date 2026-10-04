@@ -40,6 +40,9 @@ CLIPS = [
     # Duplicate photo (CollectorApp → NewSale)
     ("hi", "यह फ़ोटो पहले इस्तेमाल हो चुकी है। अभी के कबाड़ की नई फ़ोटो लें।", None),
     ("en", "This photo was already used. Take a fresh photo of today's scrap.", None),
+    # Choosing the shop (CollectorApp → NewSale, lib/i18n.ts → voice.shop)
+    ("hi", "किस दुकान पर बेच रहे हैं?", None),
+    ("en", "Which shop are you selling to?", None),
     # Scripted demo confirmation (backend services.confirmation_text for ₹340 · 27.4 kg plastic)
     ("hi", "₹340 मिले — 27.4 किलो प्लास्टिक बोतल। आपके खाते में 27 क्रेडिट जुड़ गए।",
      "तीन सौ चालीस रुपये मिले। सत्ताईस दशमलव चार किलो प्लास्टिक बोतल। आपके खाते में सत्ताईस क्रेडिट जुड़ गए।"),

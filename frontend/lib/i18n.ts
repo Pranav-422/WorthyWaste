@@ -33,6 +33,26 @@ const strings = {
   changeMaterial: { hi: "कबाड़ बदलें", en: "Change material" },
   sendAnyway: { hi: "फिर भी भेजें", en: "Send anyway" },
   youChose: { hi: "आपने चुना", en: "You chose" },
+  // Choosing a shop
+  chooseShop: { hi: "किस दुकान पर बेच रहे हैं?", en: "Which shop are you selling to?" },
+  lastUsed: { hi: "पिछली बार यहीं", en: "last time" },
+  noShopsNearby: { hi: "5 किलोमीटर में कोई दुकान नहीं मिली", en: "No registered shop within 5 km" },
+  away: { hi: "दूर", en: "away" },
+  // My requests, and the waiting timeline
+  myRequests: { hi: "मेरे अनुरोध", en: "My requests" },
+  noRequests: { hi: "अभी कोई अनुरोध नहीं", en: "No requests yet" },
+  cancel: { hi: "रद्द करें", en: "Cancel" },
+  cancelled: { hi: "रद्द कर दिया", en: "Cancelled" },
+  stepSent: { hi: "भेजा", en: "Sent" },
+  stepAccepted: { hi: "स्वीकार", en: "Accepted" },
+  stepWeighed: { hi: "तौला", en: "Weighed" },
+  stepPaying: { hi: "पैसा भेजा जा रहा है", en: "Paying" },
+  stepPaid: { hi: "पैसा मिला", en: "Paid" },
+  sellingTo: { hi: "दुकान", en: "Shop" },
+  // What the photo check saw, when it is not one of the six materials
+  aiMixed: { hi: "मिला-जुला कबाड़", en: "a mixed load" },
+  aiNotScrap: { hi: "कबाड़ नहीं", en: "Not scrap" },
+  aiScreen: { hi: "स्क्रीन की फ़ोटो", en: "A photo of a screen" },
   // GPS
   locationDenied: { hi: "फ़ोन की जगह (GPS) बंद है", en: "Location is turned off" },
   locationDeniedHelp: {
@@ -93,4 +113,5 @@ export const voice = {
     en: "Pick the scrap, slide to the weight, take a photo and send.",
   },
   waiting: { hi: "डीलर को अपना QR कार्ड दिखाएँ।", en: "Show your QR card to the dealer." },
+  shop: { hi: "किस दुकान पर बेच रहे हैं?", en: "Which shop are you selling to?" },
 };

@@ -1,12 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, get, logout, postForm } from "@/lib/api";
-import { kg, mmss, parseTs, rupees, shortDate } from "@/lib/format";
+import { ApiError, get, logout, post, postForm } from "@/lib/api";
+import { kg, metres, mmss, parseTs, rupees, shortDate, shortTime } from "@/lib/format";
 import { mismatchMaterials, mismatchVoice, t, voice, type Lang } from "@/lib/i18n";
-import { getLocation, LocationError } from "@/lib/location";
+import { type Coords, getLocation, LocationError } from "@/lib/location";
 import { speak, speakMessage } from "@/lib/speech";
-import type { CollectorProfile, Material, Message, PhotoMismatch, SaleRequest, Transaction } from "@/lib/types";
+import type {
+  CollectorProfile, Material, Message, MyRequest, NearbyDealer, PhotoMismatch, RequestStatus,
+  SaleRequest, Transaction,
+} from "@/lib/types";
 import { LiveCamera } from "@/components/LiveCamera";
 import { QrCode } from "@/components/QrCode";
 import { ScoreMeter } from "@/components/ScoreMeter";
@@ -22,6 +25,7 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
   const [screen, setScreen] = useState<Screen>("home");
   const [tab, setTab] = useState<Tab>("card");
   const [active, setActive] = useState<SaleRequest | null>(null);
+  const [activeShop, setActiveShop] = useState("");
   const [lastTx, setLastTx] = useState<Transaction | null>(null);
 
   const load = useCallback(async () => {
@@ -92,8 +96,9 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
             lang={lang}
             demo={demo}
             onCancel={() => setScreen("home")}
-            onSent={(r) => {
+            onSent={(r, shopName) => {
               setActive(r);
+              setActiveShop(shopName);
               setScreen("waiting");
               speak(voice.waiting[lang], lang);
             }}
@@ -102,6 +107,7 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
         {screen === "waiting" && active && (
           <Waiting
             request={active}
+            shopName={activeShop}
             qr={c.qr_token}
             lang={lang}
             onDone={(tx) => {
@@ -136,6 +142,67 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
 }
 
 // ---------- Home: card / wallet / score ----------
+
+const STATUS_TONE: Record<string, string> = {
+  open: "bg-marigold-soft text-ink",
+  accepted: "bg-marigold-soft text-ink",
+  weighed: "bg-marigold-soft text-ink",
+  paying: "bg-marigold-soft text-ink",
+  completed: "bg-leaf-soft text-leaf-dark",
+  expired: "bg-brick-soft text-brick",
+  rejected: "bg-brick-soft text-brick",
+  cancelled: "bg-kraft-deep text-slate",
+  awaiting_ivr: "bg-marigold-soft text-ink",
+};
+
+function statusLabel(status: RequestStatus, lang: Lang): string {
+  const key = {
+    open: "stepSent", accepted: "stepAccepted", weighed: "stepWeighed", paying: "stepPaying",
+    completed: "stepPaid", cancelled: "cancelled", expired: "expired", rejected: "expired",
+    awaiting_ivr: "stepSent",
+  }[status];
+  return t(lang, key as Parameters<typeof t>[1]);
+}
+
+/** The collector's own sales and where each has got to — their side of the dealer's queue. */
+function MyRequests({ lang, matLabel }: { lang: Lang; matLabel: (c: string) => string }) {
+  const [rows, setRows] = useState<MyRequest[] | null>(null);
+
+  useEffect(() => {
+    const load = () => get<MyRequest[]>("/collectors/me/requests").then(setRows).catch(() => {});
+    load();
+    const id = setInterval(load, 4000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!rows) return null;
+  return (
+    <div className="rounded-2xl border border-line bg-paper">
+      <p className="px-4 pt-3 text-sm font-semibold">{t(lang, "myRequests")}</p>
+      {rows.length === 0 && <p className="px-4 pb-3 text-sm text-slate">{t(lang, "noRequests")}</p>}
+      <ul>
+        {rows.slice(0, 8).map((r) => (
+          <li key={r.id} className="flex items-center gap-3 border-t border-line px-4 py-3 first:border-0">
+            <MaterialIcon code={r.dealer_material ?? r.material} className="h-8 w-8 text-leaf" />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium">{r.shop_name ?? "—"}</p>
+              <p className="text-xs text-slate">
+                {matLabel(r.dealer_material ?? r.material)} · {kg(r.scale_kg ?? r.est_kg)} ·{" "}
+                {shortTime(r.created_at)}
+              </p>
+            </div>
+            <div className="text-right">
+              <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_TONE[r.status] ?? ""}`}>
+                {statusLabel(r.status, lang)}
+              </span>
+              {r.amount != null && <p className="mt-0.5 text-sm font-semibold tabular">{rupees(r.amount)}</p>}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 function Home({
   profile,
@@ -197,6 +264,7 @@ function Home({
                 {kg(Math.round(monthKg))} · {month.length} {lang === "hi" ? "बिक्री" : "sales"} · {c.credits} {t(lang, "credits")}
               </p>
             </div>
+            <MyRequests lang={lang} matLabel={matLabel} />
             {profile.messages.length > 0 && (
               <div className="rounded-2xl border border-line bg-paper p-4">
                 <p className="mb-2 text-sm font-semibold">{t(lang, "messages")}</p>
@@ -324,7 +392,7 @@ function NewSale({
   lang: Lang;
   demo: boolean;
   onCancel: () => void;
-  onSent: (r: SaleRequest) => void;
+  onSent: (r: SaleRequest, shopName: string) => void;
 }) {
   const [material, setMaterial] = useState("plastic");
   const [est, setEst] = useState(28);
@@ -336,28 +404,52 @@ function NewSale({
   const [warn, setWarn] = useState<{ ai: PhotoMismatch; photo: { blob: Blob; preview: string } } | null>(null);
   // Demo only: what the photo check should pretend to see, so the warning can be shown on stage.
   const [demoAi, setDemoAi] = useState("");
+  // Where we are, and the shops we can reach from here. The location is resolved when the screen
+  // opens rather than at send time, because it decides which shops are even on the list.
+  const [loc, setLoc] = useState<Coords | null>(null);
+  const [shops, setShops] = useState<NearbyDealer[] | null>(null);
+  const [shopId, setShopId] = useState<number | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    getLocation(demo ? "demo" : "gps").then(
+      (c) => live && setLoc(c),
+      (e) => {
+        if (!live) return;
+        const timedOut = e instanceof LocationError && e.reason === "timeout";
+        setError({
+          msg: t(lang, timedOut ? "locationTimeout" : "locationDenied"),
+          help: t(lang, timedOut ? "locationTimeoutHelp" : "locationDeniedHelp"),
+          rule: "location_missing",
+        });
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [demo, lang]);
+
+  useEffect(() => {
+    if (!loc) return;
+    let live = true;
+    get<NearbyDealer[]>(`/dealers/nearby?lat=${loc.lat}&lng=${loc.lng}`).then((rows) => {
+      if (!live) return;
+      setShops(rows);
+      // The shop they sold to last is the likely answer; otherwise the nearest one.
+      setShopId(rows.find((r) => r.last_used)?.id ?? rows[0]?.id ?? null);
+    }, () => live && setShops([]));
+    return () => {
+      live = false;
+    };
+  }, [loc]);
 
   async function send(p = photo, { confirmMismatch = false } = {}) {
-    if (!p) return;
+    if (!p || !loc || shopId === null) return;
     setSending(true);
     setError(null);
-    let loc;
-    try {
-      loc = await getLocation(demo ? "demo" : "gps");
-    } catch (e) {
-      // Without a location the dealer cannot be shown to be standing next to us, so say so plainly
-      // instead of sending a sale that will be refused at the scale for a reason nobody explains.
-      const timedOut = e instanceof LocationError && e.reason === "timeout";
-      setError({
-        msg: t(lang, timedOut ? "locationTimeout" : "locationDenied"),
-        help: t(lang, timedOut ? "locationTimeoutHelp" : "locationDeniedHelp"),
-        rule: "location_missing",
-      });
-      setSending(false);
-      return;
-    }
     const f = new FormData();
     f.set("collector_id", String(collectorId));
+    f.set("dealer_id", String(shopId));
     f.set("material", material);
     f.set("est_kg", String(est));
     f.set("lat", String(loc.lat));
@@ -369,7 +461,7 @@ function NewSale({
       const r = await postForm<SaleRequest>("/requests", f);
       lastPhoto = p;
       setWarn(null);
-      onSent(r);
+      onSent(r, shops?.find((x) => x.id === shopId)?.shop_name ?? "");
     } catch (e) {
       const err = e as ApiError;
       if (err.rule === "photo_mismatch") {
@@ -391,6 +483,7 @@ function NewSale({
     return (
       <PhotoWarning
         ai={warn.ai}
+        materials={materials}
         lang={lang}
         sending={sending}
         onChange={() => {
@@ -413,6 +506,40 @@ function NewSale({
           </div>
         </div>
       )}
+
+      <section>
+        <div className="mb-2 flex items-center gap-2">
+          <h2 className="text-lg font-semibold">{t(lang, "chooseShop")}</h2>
+          <button
+            onClick={() => speak(voice.shop[lang], lang)}
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-ink text-kraft"
+            aria-label="Read this question aloud"
+          >
+            <SpeakerIcon className="h-4 w-4" />
+          </button>
+        </div>
+        {shops === null ? (
+          <p className="rounded-2xl border border-line bg-paper p-4 text-sm text-slate">…</p>
+        ) : shops.length === 0 ? (
+          <p className="rounded-2xl border border-line bg-paper p-4 text-sm text-slate">
+            {t(lang, "noShopsNearby")}
+          </p>
+        ) : (
+          <select
+            value={shopId ?? ""}
+            onChange={(e) => setShopId(Number(e.target.value))}
+            className="h-16 w-full rounded-2xl border-2 border-line bg-paper px-4 text-lg font-semibold"
+            aria-label={t(lang, "chooseShop")}
+          >
+            {shops.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.shop_name} · {metres(d.distance_m)} {t(lang, "away")}
+                {d.last_used ? ` · ${t(lang, "lastUsed")}` : ""}
+              </option>
+            ))}
+          </select>
+        )}
+      </section>
 
       <section>
         <h2 className="mb-2 text-lg font-semibold">{t(lang, "whatScrap")}</h2>
@@ -516,7 +643,7 @@ function NewSale({
         </button>
         <button
           onClick={() => send()}
-          disabled={!photo || sending}
+          disabled={!photo || sending || shopId === null}
           className="h-14 flex-[3] rounded-2xl bg-leaf text-lg font-semibold text-white disabled:opacity-40"
         >
           {sending ? "…" : t(lang, "send")}
@@ -529,6 +656,21 @@ function NewSale({
 // Kept across screens so the demo can replay the "same photo again" fraud.
 let lastPhoto: { blob: Blob; preview: string } | null = null;
 
+/** What the photo check saw, in the collector's language. Falls back for the answers that are not
+ *  one of the six materials: a mixed load, nothing recyclable, or a photo of a screen. */
+function aiMaterialLabel(
+  ai: { material: string | null; real_scene: boolean | null },
+  materials: Material[],
+  lang: Lang,
+): string {
+  if (ai.real_scene === false) return t(lang, "aiScreen");
+  if (ai.material === "not_scrap") return t(lang, "aiNotScrap");
+  if (ai.material === "mixed") return t(lang, "aiMixed");
+  const m = materials.find((x) => x.code === ai.material);
+  if (m) return lang === "hi" ? m.label_hi : m.label_en;
+  return ai.material ?? "—";
+}
+
 // ---------- The photo check disagreed ----------
 
 /**
@@ -538,12 +680,14 @@ let lastPhoto: { blob: Blob; preview: string } | null = null;
  */
 function PhotoWarning({
   ai,
+  materials,
   lang,
   sending,
   onChange,
   onSendAnyway,
 }: {
   ai: PhotoMismatch;
+  materials: Material[];
   lang: Lang;
   sending: boolean;
   onChange: () => void;
@@ -552,6 +696,9 @@ function PhotoWarning({
   const line = mismatchVoice(lang, ai.material);
   const chose = lang === "hi" ? ai.chose_label_hi : ai.chose_label_en;
   const pct = ai.confidence == null ? null : Math.round(ai.confidence * 100);
+  // The spoken line is already in their language; the card has to match it. "cardboard" next to
+  // "ये गत्ता लग रहा है" reads as two different answers.
+  const seen = aiMaterialLabel(ai, materials, lang);
 
   return (
     <main className="flex flex-1 flex-col gap-4 px-4 pb-6">
@@ -581,11 +728,7 @@ function PhotoWarning({
             <StopIcon className="mx-auto my-1 h-12 w-12 text-brick" />
           )}
           <p className="text-sm font-semibold">
-            {ai.material === "not_scrap"
-              ? lang === "hi" ? "कबाड़ नहीं" : "Not scrap"
-              : ai.real_scene === false
-                ? lang === "hi" ? "स्क्रीन की फ़ोटो" : "A photo of a screen"
-                : (ai.material ?? "—")}
+            {seen}
             {pct != null && <span className="font-normal text-slate"> · {pct}%</span>}
           </p>
         </div>
@@ -611,14 +754,51 @@ function PhotoWarning({
 
 // ---------- Waiting for the dealer ----------
 
+/** Sent → Accepted → Weighed → Paying → Paid, and where this request has got to. */
+const TIMELINE = [
+  { key: "stepSent", reached: ["open", "accepted", "weighed", "paying", "completed"] },
+  { key: "stepAccepted", reached: ["accepted", "weighed", "paying", "completed"] },
+  { key: "stepWeighed", reached: ["weighed", "paying", "completed"] },
+  { key: "stepPaying", reached: ["paying", "completed"] },
+  { key: "stepPaid", reached: ["completed"] },
+] as const;
+
+function Timeline({ status, lang }: { status: RequestStatus; lang: Lang }) {
+  return (
+    <ol className="w-full space-y-1">
+      {TIMELINE.map((step, i) => {
+        const done = (step.reached as readonly string[]).includes(status);
+        const current = done && !(TIMELINE[i + 1]?.reached as readonly string[] | undefined)?.includes(status);
+        return (
+          <li key={step.key} className="flex items-center gap-3 text-left">
+            <span
+              className={`grid h-7 w-7 shrink-0 place-items-center rounded-full text-xs font-bold ${
+                done ? "bg-leaf text-white" : "bg-kraft-deep text-slate"
+              }`}
+            >
+              {done ? <CheckIcon className="h-4 w-4" /> : i + 1}
+            </span>
+            <span className={current ? "font-semibold" : done ? "" : "text-slate"}>{t(lang, step.key)}</span>
+            {current && status !== "completed" && (
+              <span className="h-2 w-2 animate-pulse rounded-full bg-leaf" aria-hidden />
+            )}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 function Waiting({
   request,
+  shopName,
   qr,
   lang,
   onDone,
   onCancel,
 }: {
   request: SaleRequest;
+  shopName: string;
   qr: string;
   lang: Lang;
   onDone: (tx: Transaction) => void;
@@ -626,6 +806,7 @@ function Waiting({
 }) {
   const [req, setReq] = useState(request);
   const [now, setNow] = useState(() => Date.now());
+  const [cancelling, setCancelling] = useState(false);
   const doneRef = useRef(false);
   const onDoneRef = useRef(onDone);
   useEffect(() => {
@@ -649,11 +830,13 @@ function Waiting({
   const left = parseTs(req.expires_at).getTime() - now;
   const status = req.status;
 
-  if (status === "expired" || status === "rejected") {
+  if (status === "expired" || status === "rejected" || status === "cancelled") {
     return (
       <main className="flex-1 space-y-4 px-4">
         <div className="rounded-2xl bg-brick p-5 text-white">
-          <p className="text-lg font-semibold">{t(lang, "expired")}</p>
+          <p className="text-lg font-semibold">
+            {status === "cancelled" ? t(lang, "cancelled") : t(lang, "expired")}
+          </p>
         </div>
         <button onClick={onCancel} className="h-14 w-full rounded-2xl bg-leaf font-semibold text-white">
           {t(lang, "done")}
@@ -664,26 +847,43 @@ function Waiting({
 
   return (
     <main className="flex flex-1 flex-col items-center gap-4 px-4 pb-6 text-center">
+      {shopName && (
+        <p className="w-full rounded-2xl bg-ink px-4 py-3 text-kraft">
+          <span className="text-xs opacity-70">{t(lang, "sellingTo")}</span>
+          <span className="block font-display text-lg font-semibold leading-tight">{shopName}</span>
+        </p>
+      )}
       <h2 className="text-2xl font-semibold">{t(lang, "showQr")}</h2>
-      <QrCode value={qr} size={260} className="rounded-2xl bg-white p-3 shadow" />
-      {status === "open" ? (
+      <QrCode value={qr} size={220} className="rounded-2xl bg-white p-3 shadow" />
+      {status === "open" && (
         <p className="text-slate">
           {t(lang, "expiresIn")} <b className="font-display text-2xl text-ink tabular">{mmss(left)}</b>
         </p>
-      ) : (
-        <p className="flex items-center gap-2 rounded-full bg-leaf-soft px-4 py-2 font-semibold text-leaf-dark">
-          <CheckIcon className="h-5 w-5" />
-          {status === "accepted" && t(lang, "accepted")}
-          {status === "weighed" && `${t(lang, "weighed")} · ${kg(req.scale_kg ?? 0)}`}
-          {status === "paying" && t(lang, "paying")}
-        </p>
       )}
+      <div className="w-full rounded-2xl border border-line bg-paper p-4">
+        <Timeline status={status} lang={lang} />
+      </div>
       <p className="text-sm text-slate tabular">
-        {kg(req.est_kg)} · #{req.id}
+        {kg(req.scale_kg ?? req.est_kg)} · #{req.id}
       </p>
-      <button onClick={onCancel} className="mt-auto text-sm text-slate underline">
-        ← {lang === "hi" ? "वापस" : "Back"}
-      </button>
+      {status === "open" ? (
+        <button
+          onClick={async () => {
+            setCancelling(true);
+            await post<SaleRequest>(`/requests/${req.id}/cancel`).catch(() => {});
+            setCancelling(false);
+            onCancel();
+          }}
+          disabled={cancelling}
+          className="mt-auto h-12 w-full rounded-2xl border-2 border-line bg-paper font-semibold text-brick disabled:opacity-50"
+        >
+          {cancelling ? "…" : t(lang, "cancel")}
+        </button>
+      ) : (
+        <button onClick={onCancel} className="mt-auto text-sm text-slate underline">
+          ← {lang === "hi" ? "वापस" : "Back"}
+        </button>
+      )}
     </main>
   );
 }
