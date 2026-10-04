@@ -68,11 +68,14 @@ def ids(client):
     return collectors, dealers
 
 
-def new_request(client, cid, img, kg=28, loc=RAJU, **extra):
-    """Logs in as that collector (their own session), then raises a sale request."""
+def new_request(client, cid, img, kg=28, loc=RAJU, dealer_id=1, **extra):
+    """Logs in as that collector (their own session), then raises a sale request to one shop.
+
+    `dealer_id` defaults to 1 (Raju Kabadi Store), the dealer the demo script uses."""
     phone = next(c["phone"] for c in client.get("/api/collectors").json() if c["id"] == cid)
     login(client, "collector", phone)
-    data = {"material": "plastic", "est_kg": kg, "lat": loc[0], "lng": loc[1], **extra}
+    data = {"material": "plastic", "est_kg": kg, "lat": loc[0], "lng": loc[1],
+            "dealer_id": dealer_id, **extra}
     return client.post("/api/requests", data=data, files={"photo": ("p.jpg", img, "image/jpeg")})
 
 

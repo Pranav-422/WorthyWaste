@@ -113,9 +113,10 @@ def test_a_dealer_never_learns_a_collectors_qr_token_phone_or_upi(anon, client):
 def test_a_sale_cannot_be_read_by_a_stranger(anon, client):
     collectors, _ = ids(client)
     req = new_request(client, collectors["Lakshmi"]["id"], photo(202), kg=9).json()
-    assert anon.get(f"/api/requests/{req['id']}").status_code == 403
+    # 404, not 403: "someone else's sale" would confirm that this sale exists.
+    assert anon.get(f"/api/requests/{req['id']}").status_code == 404
     login(anon, "collector", MEENA_PHONE)
-    assert anon.get(f"/api/requests/{req['id']}").status_code == 403
+    assert anon.get(f"/api/requests/{req['id']}").status_code == 404
     login(anon, "satin", SATIN_PHONE)
     assert anon.get(f"/api/requests/{req['id']}").status_code == 200
 
