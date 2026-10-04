@@ -82,6 +82,28 @@ def photo_phash(data: bytes) -> str:
     return phash.phash(data)
 
 
+def photo_hash_or_400(data: bytes) -> str:
+    try:
+        return photo_phash(data)
+    except Exception:
+        raise ApiError(400, "Photo could not be read")
+
+
+def refuse_duplicate_photo(conn, collector_id: int, phash_hex: str) -> None:
+    """Refuse a photo already used in the last 30 days, and record the attempt for Satin."""
+    dup = fraud.find_duplicate_photo(conn, phash_hex)
+    if not dup:
+        return
+    same = dup["collector_id"] == collector_id
+    flag = lambda c: fraud.raise_flag(  # noqa: E731
+        c, entity_type="collector", entity_id=collector_id, rule="duplicate_photo",
+        detail=("Reused a photo from" if same else "Used another collector's photo from")
+               + f" request #{dup['request_id']} (hash distance {dup['distance']})",
+        evidence=dup, collector_id=collector_id, dedupe_hours=1,
+    )
+    raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
+
+
 # ---------- Step 1: collector raises a request ----------
 
 def verify_photo(selected_material: str, jpeg: bytes) -> dict:
@@ -141,21 +163,8 @@ def create_request(conn, *, collector_id: int, material_code: str, est_kg: float
         raise ApiError(403, f"{d['shop_name']} is {distance / 1000:,.1f} km away — pick a shop within "
                             f"{fraud.DEALER_CHOICE_MAX_M // 1000} km",
                        rule="dealer_too_far", evidence={"distance_m": round(distance)})
-    try:
-        phash_hex = photo_phash(photo)
-    except Exception:
-        raise ApiError(400, "Photo could not be read")
-
-    dup = fraud.find_duplicate_photo(conn, phash_hex)
-    if dup:
-        same = dup["collector_id"] == collector_id
-        flag = lambda c: fraud.raise_flag(  # noqa: E731
-            c, entity_type="collector", entity_id=collector_id, rule="duplicate_photo",
-            detail=("Reused a photo from" if same else "Used another collector's photo from")
-                   + f" request #{dup['request_id']} (hash distance {dup['distance']})",
-            evidence=dup, collector_id=collector_id, dedupe_hours=1,
-        )
-        raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
+    phash_hex = photo_hash_or_400(photo)
+    refuse_duplicate_photo(conn, collector_id, phash_hex)
 
     clean, ai = checked or check_photo(material_code, photo, demo_ai_material)
 

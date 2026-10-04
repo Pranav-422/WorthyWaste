@@ -83,6 +83,9 @@ page hides. Without the shortcuts the collector app sends real GPS and says so p
 
 1. Collector: *नई बिक्री* → shop *Raju Kabadi Store · 0 m दूर · पिछली बार यहीं* (preselected) → plastic
    → 28 kg → take photo → *भेजें*.
+   With GEMINI_API_KEY set the photo check is real: photograph actual plastic bottles. A photo of a screen,
+   a printout or a laptop's test camera is (correctly) flagged as not a real scene. If you are recording
+   without real scrap to hand, pick *Demo: photo check sees* → `plastic` before taking the photo.
 2. Dealer: tap Meena's request → scan her QR (or *Demo: simulate a successful scan*) → "Location matched".
    Her waiting screen ticks *भेजा → स्वीकार → तौला → पैसा मिला* as he goes.
 3. Dealer: *Weigh* → 27.4 kg vs 28 kg estimate, within 10%.

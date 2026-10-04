@@ -456,6 +456,12 @@ async def create_request(
     data = await photo.read()
     if len(data) > 4_000_000:
         raise ApiError(413, "Photo too large")
+    # A reused photo is refused before the photo check: no point waiting seconds and paying for a
+    # model call on a sale that is about to be turned down. (create_request checks again, inside
+    # its transaction, in case the same photo arrives twice at once.)
+    phash_hex = await run_in_threadpool(services.photo_hash_or_400, data)
+    with _tx() as conn:
+        services.refuse_duplicate_photo(conn, me_id, phash_hex)
     # The photo check calls an external model and can take seconds. Run it before taking the
     # instance lock and opening a transaction, and off the event loop, so a slow model never stalls
     # other requests or holds a database connection open.
@@ -469,11 +475,15 @@ async def create_request(
 
 def _may_see_request(request: Request, req: dict) -> bool:
     """The collector it belongs to, the dealer they chose, or Satin. Nobody else."""
+    # Compare only real sessions: requests from before dealer choice have dealer_id NULL, and an
+    # anonymous visitor's missing session must not "match" that.
     if _session(request, "satin") is not None:
         return True
-    if _session(request, "collector") == req["collector_id"]:
+    collector = _session(request, "collector")
+    if collector is not None and collector == req["collector_id"]:
         return True
-    return _session(request, "dealer") == req["dealer_id"]
+    dealer = _session(request, "dealer")
+    return dealer is not None and dealer == req["dealer_id"]
 
 
 @api.get("/requests/{request_id}")

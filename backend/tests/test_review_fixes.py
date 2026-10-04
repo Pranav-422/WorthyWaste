@@ -68,3 +68,50 @@ def test_setup_lock_is_released_and_never_left_behind(client):
     assert held() == 0
     reset(client)
     assert held() == 0
+
+
+def test_nobody_logged_in_cannot_read_a_request_without_a_dealer(client):
+    """Requests from before dealer choice have dealer_id NULL. A visitor with no session at all must
+    not 'match' that missing dealer."""
+    reset(client)
+    from app import clock
+    cur = main._db.execute(
+        "INSERT INTO sale_requests (collector_id, material, est_kg, lat, lng, photo_url, status, created_at, "
+        "expires_at) VALUES (1, 'plastic', 20, 28.67312, 77.28654, '/api/photos/x.jpg', 'expired', ?, ?)",
+        (clock.ts(), clock.ts()))
+    rid = cur.lastrowid
+    from fastapi.testclient import TestClient
+    with TestClient(main.app) as anon:
+        assert anon.get(f"/api/requests/{rid}").status_code == 404
+    with TestClient(main.app) as gupta:  # a dealer, but not this request's, and nobody else's cookies
+        login(gupta, "dealer", "9811000002")
+        assert gupta.get(f"/api/requests/{rid}").status_code == 404
+    with TestClient(main.app) as meena:
+        login(meena, "collector", MEENA_PHONE)
+        assert meena.get(f"/api/requests/{rid}").status_code == 200  # her own
+
+
+class CountingVerifier(adapters.PhotoVerifier):
+    def __init__(self):
+        self.calls = 0
+
+    def check(self, jpeg: bytes, selected_material: str):
+        self.calls += 1
+        return adapters.PhotoCheck(available=True, material=selected_material, confidence=0.95,
+                                   real_scene=True, approx_quantity="one sack", notes="counted")
+
+
+def test_a_reused_photo_is_refused_before_the_photo_check(client):
+    reset(client)
+    collectors, _ = ids(client)
+    spy = CountingVerifier()
+    before = adapters.photo_verifier
+    adapters.photo_verifier = spy
+    try:
+        assert new_request(client, collectors["Lakshmi"]["id"], photo(801), kg=10).status_code == 201
+        assert spy.calls == 1
+        again = new_request(client, collectors["Lakshmi"]["id"], photo(801), kg=10)
+    finally:
+        adapters.photo_verifier = before
+    assert again.status_code == 409 and again.json()["rule"] == "duplicate_photo"
+    assert spy.calls == 1  # no model call for the reused photo
