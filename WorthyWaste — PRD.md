@@ -102,6 +102,85 @@ Targets are pilot hypotheses, to be set with Satin before launch.
 | Fraud flags confirmed vs raised | Checks are accurate, not noisy | To set |
 | Traceability fee paid per tonne | Brands value the data | At least one paying recycler or brand |
 
+## Phase 2: from the household to the recycler
+
+**Every hand that waste passes through gets a verified record.** Phase 1 covers the middle of the chain (waste picker → dealer → recycler). Phase 2 adds the two ends that are missing: the household where waste is created, and the door-to-door garbage collector who picks it up.
+
+### Why
+
+- **Door-to-door garbage collectors** do daily, routine work, often through contractors and often paid irregularly. They face the same problem as waste pickers: steady income, no record. For Satin, that is a second new borrower segment.
+- **Households** decide whether recyclables arrive clean and separated. Segregated dry waste is worth more to every collector, dealer and recycler downstream, but households have no reason to separate.
+- **Municipalities (ULBs)** must show door-to-door coverage and segregation, but rarely have house-level data.
+- **Brands** need to show their packaging was recovered (EPR). Source-level traces are stronger evidence than dealer-level ones.
+
+One doorstep scan serves all four. The household gets a segregation record and rewards, the collector gets proof of work, the ULB gets coverage data, and the material is traced from the source.
+
+### New personas
+
+Illustrative, to be checked against interviews in the pilot ward.
+
+| Persona | Who | Pain today | What WorthyWaste gives |
+| --- | --- | --- | --- |
+| **Sunil, door-to-door collector** | Drives a ULB or contractor garbage vehicle, covers about 300 homes a day | Wages late or in cash, no record of work done, no access to credit | Verified daily work log, income proof, a score and a group-backed loan |
+| **Anita, household** | Runs a home in an RWA society, no time for apps | No reason to separate waste; doesn't know what happens to it | No app needed: a QR sticker on the door, a WhatsApp message per pickup, points she can redeem |
+| **Ward officer, ULB** | Responsible for coverage and segregation in a ward | Paper registers, no way to see missed homes or unsegregated waste | A ward dashboard: homes covered, segregation rate, missed pickups |
+
+### How it works
+
+1. **Onboarding.** Each home gets a QR sticker on the door, linked to the address (no name needed). The household opts in once via WhatsApp.
+2. **Pickup.** The collector scans the door QR. The app records GPS and time, and the collector marks *separated* or *mixed*, with a photo for dry waste. The same photo check used for waste pickers runs here.
+3. **Household.** A WhatsApp message: "Aaj aapka kachra alag mila — +10 points". Points are redeemable for mobile recharge, local shop discounts, or brand offers.
+4. **Collector.** Every verified pickup adds to their work record, which feeds the same score engine (activity, consistency, tenure) as waste pickers.
+5. **Downstream.** Dry waste from the vehicle is weighed at the material recovery facility (MRF) or sold to a dealer, and enters the existing batch trace.
+
+### Requirements
+
+| ID | User story | Acceptance criteria | Priority |
+| --- | --- | --- | --- |
+| R15 | As a garbage collector, I scan a home's door QR at pickup | GPS within about 30 m of the registered home; one scan per home per day | P0 — Phase 2 pilot |
+| R16 | As a garbage collector, I mark the waste separated or mixed, with a photo for dry waste | Photo check runs; same "never block on an AI guess" rule as R1 | P0 — Phase 2 pilot |
+| R17 | As a household, I get a WhatsApp message and points for each separated pickup | No app install; message in the household's language | P0 — Phase 2 pilot |
+| R18 | As a household, I redeem points | At least one redemption option (e.g. mobile recharge) in the pilot | P1 |
+| R19 | As Satin, I see a garbage collector's work record and score | Same five-input score and eligibility rule as waste pickers | P0 — Phase 2 pilot |
+| R20 | As a ward officer, I see coverage and segregation by street | Homes covered today, segregation rate, homes missed for 2+ days | P1 |
+| R21 | As a brand, I sponsor household rewards for my packaging | Sponsored offers; report of recovered volume by ward | P2 |
+| R22 | As a household, I control my data | Address-level only, no name; opt out by WhatsApp; ULB and brands see ward totals only | P0 — Phase 2 pilot |
+
+### Fraud controls
+
+| Risk | Control |
+| --- | --- |
+| Collector scans doors without picking up | GPS and time per scan; route plausibility (100 homes can't be scanned in 5 minutes); household can reply "no pickup today" |
+| Collector and household collude to fake "separated" | Photo check; random spot checks; ward-level mass balance: separated dry waste scanned vs dry waste weighed at the MRF or sold to a dealer |
+| QR stickers copied or moved | GPS must match the registered home; one scan per home per day |
+| Points farming | Points cap per home per month; rewards only on separated pickups confirmed downstream |
+
+### Revenue
+
+| Who pays | For what |
+| --- | --- |
+| ULB | Ward dashboard and verified coverage data (Swachh Bharat Mission budgets), per home per month |
+| Brands and recyclers | Source-level EPR traceability; sponsoring household rewards |
+| Satin | Interest income from garbage collectors and, later, households (e.g. women's SHGs) |
+
+### Pilot
+
+One ward or one large RWA society: 1–2 collection vehicles, 200–300 homes, 3 months, alongside the Phase 1 waste-picker pilot in the same city.
+
+| Metric | Why it matters | Target |
+| --- | --- | --- |
+| Homes scanned at least 5 days a week | Collectors actually use it | To set |
+| Share of pickups marked separated | Behaviour change | Rising week on week |
+| Households who redeem points | Rewards motivate | To set |
+| Dry waste weighed vs scanned (mass balance) | Data is honest | Within 15% |
+| Garbage collectors eligible for a first loan | Second borrower segment works | To set with Satin |
+
+### Phase 2 open questions
+
+- [ ] Which ULB or RWA will host the pilot ward, and who employs the collectors there (ULB or contractor)?
+- [ ] What rewards can be funded at launch, and by whom (brand, ULB, or our margin)?
+- [ ] Does the ULB already run a door-to-door tracking system we must integrate with rather than replace?
+
 ## Assumptions, risks and open questions
 
 | Risk or assumption | Mitigation |
