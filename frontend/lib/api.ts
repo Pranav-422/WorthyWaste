@@ -9,9 +9,9 @@ export class ApiError extends Error {
   }
 }
 
-export type Role = "collector" | "dealer" | "satin";
+export type Role = "collector" | "dealer" | "satin" | "household" | "ops";
 
-const ROLES: Role[] = ["collector", "dealer", "satin"];
+const ROLES: Role[] = ["collector", "dealer", "satin", "household", "ops"];
 
 async function handle<T>(res: Response): Promise<T> {
   const body = await res.json().catch(() => ({}));

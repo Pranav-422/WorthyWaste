@@ -34,6 +34,8 @@ type CollectorRow = {
   open_flags: number;
   basic_phone: number;
   created_at: string;
+  kind: "waste_picker" | "door_to_door";
+  pickup_days: number;
 };
 
 type Group = {
@@ -282,7 +284,7 @@ function CollectorsView({ rows, onOpen }: { rows: CollectorRow[]; onOpen: (id: n
               <th className="px-4 py-3 font-medium">Collector</th>
               <th className="font-medium">Group</th>
               <th className="text-right font-medium">Score</th>
-              <th className="text-right font-medium">Sales</th>
+              <th className="text-right font-medium">Sales / pickup days</th>
               <th className="text-right font-medium">Total kg</th>
               <th className="px-4 text-right font-medium">Flags</th>
             </tr>
@@ -292,12 +294,14 @@ function CollectorsView({ rows, onOpen }: { rows: CollectorRow[]; onOpen: (id: n
               <tr key={r.id} onClick={() => onOpen(r.id)} className="cursor-pointer border-t border-line hover:bg-kraft/30">
                 <td className="px-4 py-3 font-medium">
                   {r.name}
-                  <span className="block text-xs font-normal text-slate">since {shortDate(r.created_at)}</span>
+                  <span className="block text-xs font-normal text-slate">
+                    {r.kind === "door_to_door" ? "Door-to-door · " : ""}since {shortDate(r.created_at)}
+                  </span>
                 </td>
                 <td className="text-slate">{r.group_name ?? "—"}</td>
                 <td className="text-right font-display text-lg font-semibold tabular">{r.score ?? "—"}</td>
-                <td className="text-right tabular">{r.sales}</td>
-                <td className="text-right tabular">{Math.round(r.total_kg).toLocaleString("en-IN")}</td>
+                <td className="text-right tabular">{r.kind === "door_to_door" ? `${r.pickup_days} d` : r.sales}</td>
+                <td className="text-right tabular">{r.kind === "door_to_door" ? "—" : Math.round(r.total_kg).toLocaleString("en-IN")}</td>
                 <td className="px-4 text-right">
                   {r.open_flags ? <span className="rounded-full bg-brick px-2 py-0.5 text-xs font-semibold text-white">{r.open_flags}</span> : <span className="text-slate">—</span>}
                 </td>
@@ -331,6 +335,7 @@ function CollectorDetail({ id, onBack, onChanged }: { id: number; onBack: () => 
         <div>
           <h1 className="text-3xl font-semibold">{c.name}</h1>
           <p className="text-sm text-slate">
+            {c.kind === "door_to_door" ? "Door-to-door collector · " : ""}
             {c.group_name} · {c.city} · joined {shortDate(c.created_at)} · {c.basic_phone ? "basic phone" : "smartphone"} · ID verified via e-Shram (hash only)
           </p>
         </div>
@@ -397,7 +402,9 @@ function CollectorDetail({ id, onBack, onChanged }: { id: number; onBack: () => 
 
           <div className="rounded-2xl border border-line bg-white p-4">
             <h2 className="font-semibold">Verified income per week</h2>
-            <p className="mb-2 text-xs text-slate">Last 12 weeks · UPI-paid sales only</p>
+            <p className="mb-2 text-xs text-slate">
+              Last 12 weeks · {c.kind === "door_to_door" ? "pickup fees from households' UPI AutoPay" : "UPI-paid sales only"}
+            </p>
             <ColumnChart
               data={p.income_by_week.map((w) => ({ label: shortDate(w.week_start + " 00:00:00"), value: w.value, detail: `Week of ${shortDate(w.week_start + " 00:00:00")}` }))}
               format={(v) => rupees(v)}
@@ -416,7 +423,35 @@ function CollectorDetail({ id, onBack, onChanged }: { id: number; onBack: () => 
             </div>
           )}
 
-          <div className="rounded-2xl border border-line bg-white">
+          {c.kind === "door_to_door" && (
+            <div className="rounded-2xl border border-line bg-white">
+              <h2 className="px-4 pt-4 font-semibold">Pickups</h2>
+              <p className="px-4 text-xs text-slate">Each one a QR scan at the home&apos;s door, GPS-matched</p>
+              <table className="w-full text-sm">
+                <tbody>
+                  {p.pickups.slice(0, 12).map((x) => (
+                    <tr key={x.id} className="border-t border-line first:border-0">
+                      <td className="py-2 pl-4">{x.household_name}</td>
+                      <td className="text-slate">{shortDate(x.created_at)}</td>
+                      <td className={x.status === "disputed" ? "text-brick" : x.segregation === "separated" ? "text-leaf" : "text-slate"}>
+                        {x.status === "disputed" ? "disputed" : x.segregation}
+                      </td>
+                      <td className="text-right text-slate tabular">{Math.round(x.distance_m)} m</td>
+                      <td className="pr-4 text-right font-semibold tabular">{x.fee != null ? rupees(x.fee) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {p.insurance.policy && (
+            <p className="rounded-2xl border border-line bg-white p-4 text-sm">
+              <b>Insured</b> · {rupees(p.insurance.policy.cover)} accident + hospital cover since {shortDate(p.insurance.policy.started_at)}
+            </p>
+          )}
+
+          <div className={`rounded-2xl border border-line bg-white ${c.kind === "door_to_door" ? "hidden" : ""}`}>
             <h2 className="px-4 pt-4 font-semibold">Sales history</h2>
             <table className="w-full text-sm">
               <tbody>

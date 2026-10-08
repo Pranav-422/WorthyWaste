@@ -6,14 +6,17 @@ import { useState } from "react";
 import { ApiError, post } from "@/lib/api";
 import { Logo, StopIcon } from "@/components/icons";
 
-type Role = "collector" | "dealer" | "satin";
+type Role = "collector" | "dealer" | "household" | "satin" | "ops";
 
-const ROLES: Role[] = ["collector", "dealer", "satin"];
+// The WorthyWaste team logs in from a link under the form, not a tab: it isn't anyone's first stop.
+const ROLES: Role[] = ["collector", "dealer", "household", "satin"];
 
 const COPY = {
-  collector: { tab: "Collector", tabHi: "कबाड़ बेचने वाले", title: "नमस्ते! लॉग इन करें", sub: "Log in to sell scrap and see your score" },
+  collector: { tab: "Collector", tabHi: "कलेक्टर", title: "नमस्ते! लॉग इन करें", sub: "Sell scrap, or record your door-to-door pickups" },
   dealer: { tab: "Dealer", tabHi: "कबाड़ी दुकान", title: "Dealer login", sub: "Scan, weigh and pay collectors by UPI" },
+  household: { tab: "Home", tabHi: "घर / सोसाइटी", title: "Green Wallet", sub: "Your pickups, points and AutoPay" },
   satin: { tab: "Satin", tabHi: "शाखा प्रबंधक", title: "Satin branch login", sub: "Review fraud flags, scores and loans" },
+  ops: { tab: "Team", tabHi: "WorthyWaste", title: "WorthyWaste team", sub: "Revenue, wards and month-end billing" },
 };
 
 export function LoginForm({ initialRole }: { initialRole: Role }) {
@@ -56,17 +59,17 @@ export function LoginForm({ initialRole }: { initialRole: Role }) {
       </Link>
 
       <div className="mt-6 w-full max-w-md rounded-3xl border border-line bg-paper p-5 shadow-sm sm:p-7">
-        <div role="tablist" aria-label="Who are you?" className="grid grid-cols-3 gap-1 rounded-2xl bg-kraft-deep/60 p-1">
+        <div role="tablist" aria-label="Who are you?" className="grid grid-cols-4 gap-1 rounded-2xl bg-kraft-deep/60 p-1">
           {ROLES.map((r) => (
             <button
               key={r}
               role="tab"
               aria-selected={role === r}
               onClick={() => switchRole(r)}
-              className={`rounded-xl px-3 py-2.5 text-center leading-tight ${role === r ? "bg-white shadow-sm" : "text-slate"}`}
+              className={`rounded-xl px-1 py-2.5 text-center leading-tight ${role === r ? "bg-white shadow-sm" : "text-slate"}`}
             >
-              <span className="block font-semibold">{COPY[r].tab}</span>
-              <span className="block text-xs">{COPY[r].tabHi}</span>
+              <span className="block text-sm font-semibold">{COPY[r].tab}</span>
+              <span className="block text-[11px]">{COPY[r].tabHi}</span>
             </button>
           ))}
         </div>
@@ -123,13 +126,23 @@ export function LoginForm({ initialRole }: { initialRole: Role }) {
             disabled={busy || phone.length !== 10 || pin.length !== 4}
             className="h-14 w-full rounded-2xl bg-leaf text-lg font-semibold text-white shadow-[0_4px_0_#155c39] disabled:opacity-40"
           >
-            {busy ? "…" : role === "collector" ? "लॉग इन · Log in" : "Log in"}
+            {busy ? "…" : role === "collector" || role === "household" ? "लॉग इन · Log in" : "Log in"}
           </button>
         </form>
       </div>
 
-      <p className="mt-6 max-w-md text-center text-xs text-slate">
-        Each role has its own session, so a collector, a dealer and Satin can be signed in side by side
+      {role !== "ops" ? (
+        <button onClick={() => switchRole("ops")} className="mt-4 text-xs text-slate underline">
+          WorthyWaste team login
+        </button>
+      ) : (
+        <button onClick={() => switchRole("collector")} className="mt-4 text-xs text-slate underline">
+          ← Back to app logins
+        </button>
+      )}
+
+      <p className="mt-4 max-w-md text-center text-xs text-slate">
+        Each role has its own session, so everyone in a demo can be signed in side by side
         in one browser — which is how <Link href="/demo" className="underline">the demo stage</Link> works.
       </p>
     </main>

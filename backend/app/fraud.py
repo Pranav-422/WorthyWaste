@@ -32,6 +32,12 @@ MASS_BALANCE_MIN_KG = 500  # too little volume and normal stock lag looks like a
 PHOTO_MATCH_CONFIDENCE = 0.80
 PHOTO_MISMATCH_REPEATS = 3
 PHOTO_MISMATCH_WINDOW_DAYS = 7
+# Door-to-door pickups (Phase 2).
+PICKUP_GPS_MAX_M = 50          # collector's phone vs the home's registered location
+PICKUP_BURST_MAX = 25          # more doors than this in PICKUP_BURST_WINDOW_MIN is not a real round
+PICKUP_BURST_WINDOW_MIN = 5
+PICKUP_DISPUTE_REPEATS = 3     # households saying "no pickup today" this often in a week is a pattern
+PICKUP_DISPUTE_WINDOW_DAYS = 7
 
 
 class Blocked(Exception):
@@ -325,6 +331,50 @@ def check_mass_balance(conn, dealer_id: int) -> int | None:
                       detail=detail, evidence=mb, dealer_id=dealer_id)
 
 
+# ---------- Door-to-door pickups (Phase 2) ----------
+
+def find_duplicate_pickup_photo(conn, new_hash: str) -> dict | None:
+    """A door-to-door collector reusing one photo of separated waste for every door."""
+    since = clock.ago(days=DUP_PHOTO_WINDOW_DAYS)
+    best = None
+    for r in conn.execute(
+        "SELECT id, collector_id, photo_phash, created_at FROM pickups "
+        "WHERE photo_phash IS NOT NULL AND created_at >= ?", (since,)):
+        d = phash.distance(new_hash, r["photo_phash"])
+        if d <= DUP_PHOTO_MAX_DISTANCE and (best is None or d < best["distance"]):
+            best = {"pickup_id": r["id"], "collector_id": r["collector_id"],
+                    "distance": int(d), "created_at": r["created_at"]}
+    return best
+
+
+def check_pickup_burst(conn, collector_id: int) -> int | None:
+    """Scanning many doors in a few minutes means stickers are being scanned without the rounds."""
+    n = conn.execute("SELECT COUNT(*) FROM pickups WHERE collector_id = ? AND created_at >= ?",
+                     (collector_id, clock.ago(minutes=PICKUP_BURST_WINDOW_MIN))).fetchone()[0]
+    if n <= PICKUP_BURST_MAX:
+        return None
+    return raise_flag(
+        conn, entity_type="collector", entity_id=collector_id, rule="pickup_burst",
+        detail=f"{n} doors scanned in {PICKUP_BURST_WINDOW_MIN} minutes (a real round manages at most "
+               f"{PICKUP_BURST_MAX})",
+        evidence={"doors": n, "window_min": PICKUP_BURST_WINDOW_MIN}, collector_id=collector_id,
+        dedupe_hours=12)
+
+
+def check_pickup_disputes(conn, collector_id: int) -> int | None:
+    """One household saying "no pickup today" is recorded on the pickup. Three in a week is a pattern."""
+    n = conn.execute("SELECT COUNT(*) FROM pickups WHERE collector_id = ? AND status = 'disputed' "
+                     "AND disputed_at >= ?",
+                     (collector_id, clock.ago(days=PICKUP_DISPUTE_WINDOW_DAYS))).fetchone()[0]
+    if n < PICKUP_DISPUTE_REPEATS:
+        return None
+    return raise_flag(
+        conn, entity_type="collector", entity_id=collector_id, rule="pickup_disputed",
+        detail=f"Households reported {n} scanned pickups that did not happen in "
+               f"{PICKUP_DISPUTE_WINDOW_DAYS} days",
+        evidence={"disputes": n, "window_days": PICKUP_DISPUTE_WINDOW_DAYS}, collector_id=collector_id)
+
+
 RULE_LABELS = {
     "duplicate_photo": "Duplicate photo",
     "location_mismatch": "Location mismatch",
@@ -334,4 +384,6 @@ RULE_LABELS = {
     "pair_frequency": "Pair frequency",
     "mass_balance": "Mass balance",
     "photo_mismatch": "Photo mismatch",
+    "pickup_burst": "Too many doors too fast",
+    "pickup_disputed": "Pickups disputed by households",
 }

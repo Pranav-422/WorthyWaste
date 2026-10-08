@@ -9,12 +9,20 @@ Story (Design Doc, 'Demo click path'):
   * Farida — 180 kg in one day on a hand cart → volume-outlier flag.
   * Sunita — new, 9 sales, loan unlocks in 11 more.
   * Lakshmi — repaid her first loan on time, second cycle running.
+
+Phase 2 (door-to-door collection, see _build_phase2):
+  * Sunil — door-to-door collector, 30 doors in Shanti Apartments, two months of verified pickups:
+    eligible for a first loan on pickup fees alone.
+  * Anita (B-204) — separates almost every day; Green Wallet AutoPay on, points to redeem. The live
+    demo scans her door. Her home sits on the demo spot, so ?demo=1 is standing at her door.
+  * Hotel Shiv Sagar — a bulk generator on the monthly plan with the compliance report.
+  * Vikas — new on the job; scanned 30 doors in 4 minutes → "too many doors too fast" flag.
 """
 import hashlib
 import random
 from datetime import datetime, timedelta
 
-from . import adapters, auth, clock, fraud, score, services
+from . import adapters, auth, clock, fraud, households, revenue, score, services
 from .db import TABLES, Database, init_db, transaction
 
 # Sample logins for the demo (shown on the login page). Every seeded account uses this PIN.
@@ -46,6 +54,20 @@ DEALERS = [
 SATIN_USERS = [
     ("Priya Sharma", "9812000001", "Satin Creditcare · Narela branch"),
 ]
+
+# The WorthyWaste team (revenue, wards, billing).
+OPS_USERS = [("WorthyWaste Ops", "9813000001")]
+
+# ---------- Phase 2 ----------
+WARD = "Shanti Nagar (pilot ward)"
+DOOR_GROUP = "Safai Mitra Samooh"
+DOOR_COLLECTORS = [
+    # name, phone, days on platform, vpa, qr
+    ("Sunil Kumar", "9810000006", 75, "sunil@okaxis", "WWC-SUNIL006"),
+    ("Vikas Paswan", "9810000007", 24, "vikas@ybl", "WWC-VIKAS007"),
+]
+ANITA_PHONE = "9814000001"
+HOTEL_PHONE = "9814000002"
 
 
 def ensure_satin_users(conn: Database) -> None:
@@ -225,8 +247,158 @@ def _build(conn: Database, wipe: bool) -> None:
             (cids["Lakshmi"], clock.ts(real_now - timedelta(days=220)),
              cids["Lakshmi"], clock.ts(real_now - timedelta(days=40))))
 
+        _build_phase2(conn, real_now, dids["Raju"], cids)
+
         conn.execute("DELETE FROM messages")
         score.recompute_all(conn)
+
+
+def _monthly(conn, real_now, start_days_ago: int, stream: str, amount: float, **ref):
+    """A subscription billed every 30 days since it started, as it would have been."""
+    try:
+        for d in range(start_days_ago, 0, -30):
+            clock.freeze(real_now - timedelta(days=d))
+            revenue.record(conn, stream, amount, **ref)
+    finally:
+        clock.freeze(None)
+
+
+def _build_phase2(conn: Database, real_now: datetime, raju_id: int, cids: dict) -> None:
+    """Households, door-to-door collectors and two months of pickups, replayed through the real
+    pickup and AutoPay code, plus the other pilot revenue streams."""
+    rng = random.Random(2026)
+    for name, phone in OPS_USERS:
+        conn.execute("INSERT INTO ops_users (name, phone, pin_hash, created_at) VALUES (?,?,?,?)",
+                     (name, phone, auth.hash_pin(DEMO_PIN), clock.ts(real_now - timedelta(days=300))))
+    conn.execute("INSERT INTO groups (id, name, leader_id, city) VALUES (2, ?, NULL, ?)", (DOOR_GROUP, CITY))
+    door = {}
+    for name, phone, days, vpa, qr in DOOR_COLLECTORS:
+        joined = clock.ts(real_now - timedelta(days=days, hours=2))
+        cur = conn.execute(
+            "INSERT INTO collectors (name, phone, pin_hash, language, id_type, id_ref_hash, group_id, "
+            "group_guarantee, qr_token, upi_vpa, equipment, kind, consent_at, created_at) "
+            "VALUES (?,?,?, 'hi', 'e-Shram', ?, 2, 1, ?, ?, 'cycle_rickshaw', 'door_to_door', ?, ?)",
+            (name, phone, auth.hash_pin(DEMO_PIN), hashlib.sha256(f"demo-salt:{phone}".encode()).hexdigest(),
+             qr, vpa, joined, joined))
+        door[name.split()[0]] = cur.lastrowid
+    conn.execute("UPDATE groups SET leader_id = ? WHERE id = 2", (door["Sunil"],))
+
+    onboarded = clock.ts(real_now - timedelta(days=63))
+    homes = []  # (id, separate_rate or None for "improves over time", collector)
+
+    def home(name, phone, lat, lng, collector, *, kind="home", plan="per_pickup", fee=None, monthly=None,
+             mandate=True, contact=None, rate=None):
+        cur = conn.execute(
+            "INSERT INTO households (kind, name, contact_name, phone, pin_hash, language, ward, lat, lng, door_qr, "
+            "collector_id, fee_plan, fee_per_pickup, monthly_fee, mandate_vpa, mandate_status, mandate_limit, "
+            "created_at) VALUES (?,?,?,?,?, 'hi', ?,?,?,?,?,?,?,?,?,?,?,?)",
+            (kind, name, contact, phone, auth.hash_pin(DEMO_PIN), WARD, lat, lng,
+             "WWH-" + hashlib.sha256(f"door:{phone}".encode()).hexdigest()[:8].upper(), collector, plan,
+             fee or households.DEFAULT_FEE_PER_PICKUP, monthly or households.DEFAULT_MONTHLY_FEE,
+             f"{phone}@upi" if mandate else None, "active" if mandate else "none",
+             300.0 if kind == "home" else 3000.0 if mandate else 0, onboarded))
+        homes.append((cur.lastrowid, rate, collector))
+        return cur.lastrowid
+
+    lat0, lng0 = RAJU  # the demo spot: Anita's building
+    anita = home("B-204, Shanti Apartments", ANITA_PHONE, lat0, lng0, door["Sunil"], contact="Anita Verma",
+                 rate=0.93)
+    hotel = home("Hotel Shiv Sagar", HOTEL_PHONE, lat0 + 0.0009, lng0 + 0.0006, door["Sunil"], kind="bulk",
+                 plan="monthly", fee=50.0, monthly=1500.0, contact="Front office", rate=0.85)
+    n = 0
+    for block in "ABCD":
+        for flat in (101, 102, 201, 202, 301, 302, 401):
+            if len([h for h in homes if h[2] == door["Sunil"]]) >= 30:
+                break
+            if (block, flat) == ("B", 204):
+                continue
+            n += 1
+            home(f"{block}-{flat}, Shanti Apartments", f"98140001{n:02d}",
+                 lat0 + rng.uniform(-0.0012, 0.0012), lng0 + rng.uniform(-0.0012, 0.0012), door["Sunil"],
+                 plan="monthly" if n % 5 == 0 else "per_pickup", mandate=n % 9 != 0)
+    for i in range(1, 31):
+        home(f"House {i}, Gali 4, Shanti Nagar", f"98140002{i:02d}", lat0 + 0.006 + rng.uniform(-0.001, 0.001),
+             lng0 + 0.004 + rng.uniform(-0.001, 0.001), door["Vikas"], mandate=i % 4 != 0)
+    loc = {h["id"]: (h["lat"], h["lng"]) for h in conn.execute("SELECT id, lat, lng FROM households")}
+
+    def pick(hid, collector, when, separated):
+        clock.freeze(when)
+        lat, lng = loc[hid]
+        households.record_pickup(conn, collector_id=collector, door_qr=conn.execute(
+            "SELECT door_qr FROM households WHERE id = ?", (hid,)).fetchone()[0],
+            segregation="separated" if separated else "mixed", lat=lat + 0.00005, lng=lng, notify=hid == anita)
+
+    try:
+        day0 = (real_now + clock.IST).replace(hour=0, minute=0, second=0) - clock.IST  # today 00:00 IST, in UTC
+        for days_ago in range(62, 0, -1):
+            start = day0 - timedelta(days=days_ago) + timedelta(hours=1, minutes=30 + rng.randint(0, 40))  # ~7:15 IST
+            clock.freeze(start)
+            households.settle_ready(conn)
+            # Segregation catches on over the two months: about a third at first, most homes by now.
+            base = 0.35 + 0.5 * (62 - days_ago) / 62
+            for collector, joined_days in ((door["Sunil"], 62), (door["Vikas"], 20)):
+                if days_ago > joined_days or rng.random() < 0.1:  # not yet working, or a day off
+                    continue
+                t = start
+                for hid, rate, who in homes:
+                    if who != collector or rng.random() > 0.93:
+                        continue
+                    t += timedelta(seconds=rng.randint(50, 110))
+                    pick(hid, collector, t, rng.random() < (rate or base))
+            if days_ago == 3:
+                # Vikas's burst: 30 doors in 4 minutes, from the lane outside.
+                t = start + timedelta(hours=3)
+                for hid, _, who in homes:
+                    if who == door["Vikas"] and not conn.execute(
+                            "SELECT 1 FROM pickups WHERE household_id = ? AND day = ?",
+                            (hid, clock.ist_day(t))).fetchone():
+                        t += timedelta(seconds=8)
+                        pick(hid, door["Vikas"], t, True)
+            if days_ago in (40, 20):
+                clock.freeze(start + timedelta(hours=10))
+                households.redeem(conn, anita, 100)
+            if days_ago in (47, 26):
+                # Two isolated "no pickup today" reports on Sunil's route: recorded, not a pattern.
+                victim = homes[5 + days_ago % 7][0]
+                p = conn.execute("SELECT id FROM pickups WHERE household_id = ? ORDER BY id DESC LIMIT 1",
+                                 (victim,)).fetchone()
+                if p:
+                    clock.freeze(start + timedelta(hours=6))
+                    households.dispute(conn, victim, p[0], "Nobody came")
+
+        # This morning: Sunil has done half his round. Anita's door is next, scanned live in the demo.
+        t = real_now - timedelta(minutes=50)
+        clock.freeze(t)
+        households.settle_ready(conn)
+        for hid, rate, who in homes[2:17]:
+            t += timedelta(seconds=rng.randint(60, 100))
+            pick(hid, door["Sunil"], t, rng.random() < (rate or 0.85))
+    finally:
+        clock.freeze(None)
+
+    # Other revenue streams: Raju on Pro, two insured collectors, the hotel's compliance plan, and
+    # the lead fee on Lakshmi's two Satin loans.
+    conn.execute("UPDATE dealers SET plan = 'pro', plan_since = ? WHERE id = ?",
+                 (clock.ts(real_now - timedelta(days=75)), raju_id))
+    _monthly(conn, real_now, 75, "dealer_pro", revenue.DEALER_PRO_MONTHLY_FEE, ref_type="dealer", ref_id=raju_id)
+    for cid, since in ((cids["Lakshmi"], 118), (cids["Meena"], 50)):
+        conn.execute(
+            "INSERT INTO insurance_policies (collector_id, partner, cover, monthly_premium, commission_pct, status, "
+            "started_at) VALUES (?,?,?,?,?, 'active', ?)",
+            (cid, revenue.INSURANCE_PARTNER, revenue.INSURANCE_COVER, revenue.INSURANCE_MONTHLY_PREMIUM,
+             revenue.INSURANCE_COMMISSION_PCT, clock.ts(real_now - timedelta(days=since))))
+        _monthly(conn, real_now, since, "insurance",
+                 revenue.INSURANCE_MONTHLY_PREMIUM * revenue.INSURANCE_COMMISSION_PCT, ref_type="collector",
+                 ref_id=cid)
+    conn.execute("UPDATE households SET compliance_plan = 1 WHERE id = ?", (hotel,))
+    _monthly(conn, real_now, 58, "compliance", revenue.COMPLIANCE_MONTHLY_FEE, ref_type="household", ref_id=hotel)
+    for principal, days in ((5000, 220), (10000, 40)):
+        clock.freeze(real_now - timedelta(days=days))
+        try:
+            revenue.record(conn, "loan_lead", principal * revenue.LOAN_LEAD_FEE_PCT, ref_type="collector",
+                           ref_id=cids["Lakshmi"], note=f"₹{principal:,} loan")
+        finally:
+            clock.freeze(None)
 
 
 def _replay_sale(conn, cid, did, mat, est, kg, loc, payer_vpa, payee_vpa):

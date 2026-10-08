@@ -24,3 +24,11 @@ def parse(s: str) -> datetime:
 
 def ago(**kw) -> str:
     return ts(now() - timedelta(**kw))
+
+
+IST = timedelta(hours=5, minutes=30)
+
+
+def ist_day(dt: datetime | None = None) -> str:
+    """The India calendar date of a UTC moment: what "one pickup per door per day" counts by."""
+    return ((dt or now()) + IST).strftime("%Y-%m-%d")

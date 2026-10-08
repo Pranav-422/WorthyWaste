@@ -7,7 +7,7 @@ import uuid
 from datetime import timedelta
 
 
-from . import adapters, auth, clock, fraud, phash, score
+from . import adapters, auth, clock, fraud, phash, revenue, score
 from .db import one, rows
 
 log = logging.getLogger("worthywaste.services")
@@ -532,6 +532,9 @@ def disburse_starter_loan(conn, collector_id: int) -> dict:
         "VALUES (?,?,?,?, 'active', ?)",
         (collector_id, c["group_id"], el["limit"], 6, clock.ts()),
     )
+    # Satin pays us a share of its processing fee for each borrower we originate.
+    revenue.record(conn, "loan_lead", el["limit"] * revenue.LOAN_LEAD_FEE_PCT, ref_type="loan",
+                   ref_id=cur.lastrowid, note=f"₹{el['limit']:,} starter loan")
     return one(conn.execute("SELECT * FROM loans WHERE id = ?", (cur.lastrowid,)))
 
 

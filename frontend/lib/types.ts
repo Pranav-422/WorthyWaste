@@ -119,6 +119,7 @@ export type Collector = {
   upi_vpa: string;
   basic_phone: number;
   equipment: string;
+  kind: "waste_picker" | "door_to_door";
   credits: number;
   created_at: string;
   city?: string;
@@ -170,6 +171,9 @@ export type CollectorProfile = {
   loans: Loan[];
   flags: Flag[];
   income_by_week: { week_start: string; value: number }[];
+  /** Door-to-door collectors only (Phase 2); empty for waste pickers. */
+  pickups: { id: number; day: string; segregation: string; status: string; distance_m: number; photo_url: string | null; created_at: string; household_name: string; fee: number | null; fee_status: string | null }[];
+  insurance: InsuranceStatus;
 };
 
 export type Dealer = {
@@ -184,6 +188,7 @@ export type Dealer = {
   reputation: number;
   /** When the dealer last pinned the shop from their phone; null = never (collectors may not find it). */
   location_set_at: string | null;
+  plan: "free" | "pro";
 };
 
 export type MassBalance = { bought_kg: number; sold_kg: number; gap_pct: number | null };
@@ -224,4 +229,150 @@ export type Batch = {
   total_kg: number;
   label_en: string;
   created_at: string;
+};
+
+// ---------- Phase 2: door-to-door collection, households, revenue ----------
+
+export type CollectorKind = "waste_picker" | "door_to_door";
+
+export type InsuranceStatus = {
+  policy: { id: number; partner: string; cover: number; monthly_premium: number; status: string; started_at: string } | null;
+  offer: { partner: string; cover: number; monthly_premium: number };
+};
+
+/** One door on a door-to-door collector's route, from GET /collectors/me/route. */
+export type RouteHome = {
+  id: number;
+  name: string;
+  kind: "home" | "bulk";
+  lat: number;
+  lng: number;
+  today_segregation: "separated" | "mixed" | null;
+  today_status: "done" | "disputed" | null;
+  last_day: string | null;
+};
+
+export type Route = {
+  day: string;
+  homes: RouteHome[];
+  done: number;
+  separated: number;
+  earnings: { today: number; month_paid: number; month_pending: number };
+  recent: { id: number; day: string; segregation: string; status: string; created_at: string; name: string; fee: number | null; fee_status: string | null }[];
+};
+
+export type FeeStatus = "accrued" | "due" | "paid" | "cancelled" | "refunded";
+
+export type PickupResult = {
+  pickup: { id: number; segregation: "separated" | "mixed"; day: string; photo_url: string | null };
+  fee: { id: number; fee: number; platform_fee: number; plan: "per_pickup" | "monthly"; status: FeeStatus };
+  points: number;
+  household: { id: number; name: string; kind: "home" | "bulk" };
+};
+
+export type HouseholdPickup = {
+  id: number;
+  day: string;
+  segregation: "separated" | "mixed";
+  points: number;
+  status: "done" | "disputed";
+  created_at: string;
+  fee: number | null;
+  platform_fee: number | null;
+  debited: number | null;
+  credit_used: number | null;
+  fee_status: FeeStatus | null;
+  plan: string | null;
+  can_dispute: boolean;
+};
+
+export type ComplianceReport = {
+  subscribed: boolean;
+  monthly_fee: number;
+  month: string;
+  name: string;
+  ward: string;
+  days: number;
+  handed_over: number;
+  separated: number;
+  separated_pct: number | null;
+  missed: string[];
+  log: { day: string; segregation: string; status: string; created_at: string; collector_name: string }[];
+};
+
+export type HouseholdView = {
+  household: {
+    id: number;
+    kind: "home" | "bulk";
+    name: string;
+    contact_name: string | null;
+    phone: string;
+    language: "hi" | "en";
+    ward: string;
+    door_qr: string;
+    fee_plan: "per_pickup" | "monthly";
+  };
+  collector_name: string | null;
+  wallet: {
+    mandate_status: "active" | "none";
+    mandate_limit: number;
+    mandate_vpa: string | null;
+    spent_month: number;
+    upcoming: number;
+    due: number;
+    fee_credit: number;
+    fee_plan: "per_pickup" | "monthly";
+    fee_per_pickup: number;
+    monthly_fee: number;
+    platform_fee: number;
+  };
+  points: {
+    balance: number;
+    value: number;
+    redeem_step: number;
+    earned_month: number;
+    monthly_cap: number;
+    streak: number;
+    streak_every: number;
+    streak_bonus: number;
+    per_separated: number;
+  };
+  month: { pickups: number; separated: number };
+  today: HouseholdPickup | null;
+  pickups: HouseholdPickup[];
+  messages: { id: number; text: string; language: string; created_at: string }[];
+  compliance: ComplianceReport | null;
+};
+
+export type RevenueStream = { stream: string; label: string; total: number; month: number; count: number };
+
+export type OpsOverview = {
+  revenue: { streams: RevenueStream[]; net_month: number; net_total: number; weekly: { week_start: string; value: number }[] };
+  day: string;
+  wards: { ward: string; homes: number; mandates: number; bulk: number; picked_today: number; separated_pct_30d: number | null }[];
+  separated_by_week: { week_start: string; value: number }[];
+  missed: { id: number; name: string; ward: string; collector_name: string | null; last_day: string | null }[];
+  collectors: { id: number; name: string; score: number | null; homes: number; today: number; disputes_30d: number; open_flags: number }[];
+  points_liability: number;
+  dues: number;
+  dealers_pro: number;
+  dealers: number;
+  policies: number;
+  bulk_subscribed: number;
+};
+
+export type PurchaseBill = {
+  id: number;
+  bill_no: string;
+  created_at: string;
+  material: string;
+  label_en: string;
+  label_hi: string;
+  scale_kg: number;
+  rate_per_kg: number;
+  amount: number;
+  upi_ref: string;
+  collector_name: string;
+  shop_name: string;
+  owner_name: string;
 };

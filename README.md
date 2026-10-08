@@ -107,6 +107,35 @@ why Meena stays eligible after step 6 — and a single photo mismatch is only re
 does not freeze her either.
 The dealer's location menu has a "1 km away" option, which shows the GPS block.
 
+## Phase 2: doorstep collection and the Green Wallet
+
+A door-to-door garbage collector scans the QR on a home's door (GPS within 50 m, one pickup per door per
+day) and marks the waste *separated* or *mixed*. That pickup:
+
+* earns the household points if separated (5 each, +20 for every 7 in a row, capped at 300 a month);
+  100 points = ₹5 off the collection fee,
+* owes the collector their fee (₹5 per pickup, or ₹150 a month pro-rated by pickup days), paid from the
+  household's **Green Wallet**: a UPI AutoPay mandate on their own bank account, not money we hold. The
+  WhatsApp at pickup is the 24-hour pre-debit notice, so per-pickup fees are debited the next day,
+  monthly-plan fees after the month ends. No mandate, or over its monthly limit → the fee waits as *due*,
+* counts as a verified working day and income for the collector's score (D becomes "homes served").
+
+A household can say *"पिकअप नहीं हुआ?"* within 48 h: the fee is cancelled (or refunded) and the points go back.
+Three such disputes in a week flag the collector and hold their loan; 25+ doors in 5 minutes flag a burst.
+
+Revenue streams (all prices are pilot assumptions), shown on the team dashboard `/ops`: ₹0.50 platform fee
+per pickup, 1% lead fee on each Satin loan, ₹999/month bulk-generator compliance report, ₹199/month dealer
+Pro (purchase bills), 15% commission on ₹49/month collector insurance, minus rewards redeemed.
+
+Demo stage: `/demo/doorstep` (log in as the door-to-door collector, the household and the team first; the
+collector shares a cookie with the scrap-sale stage's collector, so record the two stages separately).
+Click path: collector → *दरवाज़े का QR स्कैन करें* → *Demo: simulate scanning* → B-204 → *अलग-अलग* →
+*दर्ज करें* → "+₹5 · घर को +5 पॉइंट". Household → the pickup, the WhatsApp, *Demo: run tomorrow's AutoPay
+now*, *पिकअप नहीं हुआ?*. Team → Revenue, Wards & collection. Satin → Collectors → Sunil → loan unlocked on
+pickups alone.
+
+Existing databases get the new tables at startup but no Phase 2 data: run *Reset demo data* once.
+
 ## Photo check
 
 The duplicate-photo hash catches a photo used twice. It cannot tell whether the photo shows what the collector
@@ -190,6 +219,8 @@ either way, because the name is a hash of its text. `npm test` fails if a prompt
 | Photo vs material | Real Gemini call when `GEMINI_API_KEY` is set (`PhotoVerifier`); "unchecked" without a key | Same, thresholds tuned on pilot photos |
 | Login | Phone + PIN (PBKDF2), signed session cookie | OTP via the SMS provider; rate limits in the database |
 | Fraud rules, score v1, eligibility | Real, per Tech Spec | Thresholds tuned on pilot data |
+| Green Wallet AutoPay | Mock debit, instant on the billing run | UPI AutoPay mandates via the payment aggregator, with NPCI pre-debit notices |
+| Insurance | Policy recorded, commission booked | Partner insurer's API |
 
 ## Environment variables
 

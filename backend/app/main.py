@@ -15,7 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from . import adapters, auth, clock, fraud, score, services
+from . import adapters, auth, clock, fraud, households, revenue, score, services
 from .db import DATABASE_URL, connect, init_db, one, rows, transaction
 from .services import ApiError
 
@@ -151,6 +151,21 @@ def require_satin(request: Request) -> int:
     return uid
 
 
+def require_household(request: Request) -> int:
+    uid = _session(request, "household")
+    if uid is None:
+        raise ApiError(401, "Please log in as a household")
+    return uid
+
+
+def require_ops(request: Request) -> int:
+    """The WorthyWaste team: revenue and every ward's coverage."""
+    uid = _session(request, "ops")
+    if uid is None:
+        raise ApiError(401, "Please log in as the WorthyWaste team")
+    return uid
+
+
 def require_demo_mode() -> None:
     """Demo-only routes do not exist unless the server is in demo mode, so production cannot be
     nudged into them by guessing a URL."""
@@ -180,11 +195,13 @@ def _same(session_id: int, claimed: int | None, what: str) -> int:
 
 # Where each role's accounts live, and which column holds the display name.
 ROLE_TABLE = {"collector": ("collectors", "name"), "dealer": ("dealers", "shop_name"),
-              "satin": ("satin_users", "name")}
+              "satin": ("satin_users", "name"), "household": ("households", "name"),
+              "ops": ("ops_users", "name")}
+ROLE_PATTERN = "^(collector|dealer|satin|household|ops)$"
 
 
 class LoginBody(BaseModel):
-    role: str = Field(pattern="^(collector|dealer|satin)$")
+    role: str = Field(pattern=ROLE_PATTERN)
     phone: str = Field(min_length=10, max_length=15)
     pin: str = Field(pattern=r"^\d{4}$")
 
@@ -213,7 +230,7 @@ def login(body: LoginBody, request: Request, response: Response, conn=Depends(db
 
 
 class LogoutBody(BaseModel):
-    role: str = Field(pattern="^(collector|dealer|satin)$")
+    role: str = Field(pattern=ROLE_PATTERN)
 
 
 @api.post("/auth/logout")
@@ -268,8 +285,10 @@ def photo(name: str, conn=Depends(db)):
 @api.get("/collectors")
 def list_collectors(_satin: int = Depends(require_satin), conn=Depends(db)):
     return rows(conn.execute("""
-        SELECT c.id, c.name, c.phone, c.qr_token, c.credits, c.basic_phone, c.created_at,
+        SELECT c.id, c.name, c.phone, c.qr_token, c.credits, c.basic_phone, c.created_at, c.kind,
                g.name AS group_name, s.score,
+               (SELECT COUNT(DISTINCT day) FROM pickups p WHERE p.collector_id = c.id AND p.status = 'done')
+                 AS pickup_days,
                (SELECT COUNT(*) FROM transactions t WHERE t.collector_id = c.id) AS sales,
                (SELECT COALESCE(SUM(scale_kg),0) FROM transactions t WHERE t.collector_id = c.id) AS total_kg,
                (SELECT COUNT(*) FROM fraud_flags f WHERE f.collector_id = c.id AND f.status = 'open') AS open_flags
@@ -354,8 +373,29 @@ def collector_profile(collector_id: int, request: Request, conn=Depends(db)):
         "loans": rows(conn.execute("SELECT * FROM loans WHERE collector_id = ? ORDER BY id DESC", (collector_id,))),
         "flags": rows(conn.execute(
             "SELECT * FROM fraud_flags WHERE collector_id = ? ORDER BY id DESC", (collector_id,))),
-        "income_by_week": _weekly(conn, "collector_id", collector_id, "amount", weeks=12),
+        "income_by_week": _income_by_week(conn, collector_id, weeks=12),
+        "pickups": rows(conn.execute(
+            "SELECT p.id, p.day, p.segregation, p.status, p.distance_m, p.photo_url, p.created_at, "
+            "h.name AS household_name, f.fee, f.status AS fee_status FROM pickups p "
+            "JOIN households h ON h.id = p.household_id LEFT JOIN fee_payments f ON f.pickup_id = p.id "
+            "WHERE p.collector_id = ? ORDER BY p.id DESC LIMIT 30", (collector_id,)))
+            if c["kind"] == "door_to_door" else [],
+        "insurance": revenue.insurance_status(conn, collector_id),
     }
+
+
+def _income_by_week(conn, collector_id: int, weeks: int) -> list[dict]:
+    """Sales plus earned pickup fees, so a door-to-door collector's income shows like a waste picker's."""
+    sales = _weekly(conn, "collector_id", collector_id, "amount", weeks=weeks)
+    now = clock.now()
+    for i, w in enumerate(sales):
+        end = now - timedelta(days=7 * (weeks - 1 - i))
+        fees = conn.execute(
+            f"SELECT COALESCE(SUM(fee),0) FROM fee_payments WHERE collector_id = ? AND status IN {score.EARNED_FEE} "
+            "AND created_at >= ? AND created_at < ?",
+            (collector_id, clock.ts(end - timedelta(days=7)), clock.ts(end + timedelta(seconds=1)))).fetchone()[0]
+        w["value"] = round(w["value"] + fees, 1)
+    return sales
 
 
 @api.get("/collectors/{collector_id}/score")
@@ -626,6 +666,177 @@ def recycler_sale(body: RecyclerSaleBody, me_id: int = Depends(require_dealer), 
                                   kg=body.kg, invoice_ref=body.invoice_ref)
 
 
+# ---------- Door-to-door collection (Phase 2) ----------
+
+@api.get("/collectors/me/route")
+def my_route(me_id: int = Depends(require_collector), conn=Depends(db)):
+    return households.collector_route(conn, me_id)
+
+
+def _pickup_photo(data: bytes) -> tuple[bytes, str]:
+    try:
+        clean = adapters.reencode_jpeg(data)
+    except Exception:
+        raise ApiError(400, "Photo could not be read")
+    return clean, services.photo_hash_or_400(clean)
+
+
+@api.post("/pickups", status_code=201)
+async def create_pickup(
+    request: Request,
+    door_qr: str = Form(...), segregation: str = Form(...),
+    lat: float | None = Form(None), lng: float | None = Form(None),
+    photo: UploadFile | None = File(None),
+):
+    """The collector scanned a door's QR. The photo (of the separated dry waste) is optional; when it
+    comes, it is re-encoded (EXIF and its GPS stripped) and hashed before the lock is taken."""
+    me_id = require_collector(request)
+    prepared = None
+    if photo is not None:
+        data = await photo.read()
+        if len(data) > 4_000_000:
+            raise ApiError(413, "Photo too large")
+        if data:
+            prepared = await run_in_threadpool(_pickup_photo, data)
+    with _tx() as conn:
+        return households.record_pickup(conn, collector_id=me_id, door_qr=door_qr, segregation=segregation,
+                                         lat=lat, lng=lng, photo=prepared)
+
+
+@api.get("/collectors/me/insurance")
+def my_insurance(me_id: int = Depends(require_collector), conn=Depends(db)):
+    return revenue.insurance_status(conn, me_id)
+
+
+@api.post("/collectors/me/insurance")
+def enroll_insurance(me_id: int = Depends(require_collector), conn=Depends(db)):
+    return revenue.insurance_enroll(conn, me_id)
+
+
+# ---------- Households ----------
+
+@api.get("/households/me")
+def my_household(me_id: int = Depends(require_household), conn=Depends(db)):
+    return households.household_view(conn, me_id)
+
+
+class MandateBody(BaseModel):
+    limit: float
+
+
+@api.post("/households/me/mandate")
+def set_mandate(body: MandateBody, me_id: int = Depends(require_household), conn=Depends(db)):
+    """Turn on (or change the limit of) the household's UPI AutoPay mandate, then pay anything due."""
+    return households.set_mandate(conn, me_id, body.limit)
+
+
+@api.post("/households/me/mandate/cancel")
+def cancel_mandate(me_id: int = Depends(require_household), conn=Depends(db)):
+    households.cancel_mandate(conn, me_id)
+    return {"ok": True}
+
+
+class PlanBody(BaseModel):
+    plan: str = Field(pattern="^(per_pickup|monthly)$")
+
+
+@api.post("/households/me/plan")
+def set_plan(body: PlanBody, me_id: int = Depends(require_household), conn=Depends(db)):
+    households.set_plan(conn, me_id, body.plan)
+    return {"ok": True}
+
+
+class RedeemBody(BaseModel):
+    points: int
+
+
+@api.post("/households/me/redeem")
+def redeem_points(body: RedeemBody, me_id: int = Depends(require_household), conn=Depends(db)):
+    return households.redeem(conn, me_id, body.points)
+
+
+class DisputeBody(BaseModel):
+    reason: str | None = None
+
+
+@api.post("/households/me/pickups/{pickup_id}/dispute")
+def dispute_pickup(pickup_id: int, body: DisputeBody, me_id: int = Depends(require_household),
+                   conn=Depends(db)):
+    return households.dispute(conn, me_id, pickup_id, body.reason)
+
+
+@api.get("/households/me/compliance")
+def my_compliance(month: str | None = None, me_id: int = Depends(require_household), conn=Depends(db)):
+    h = households.household(conn, me_id)
+    if h["kind"] != "bulk":
+        raise ApiError(404, "Compliance reports are for bulk waste generators")
+    if month is not None and not (len(month) == 7 and month[4] == "-" and month.replace("-", "").isdigit()):
+        raise ApiError(400, "Month must look like 2026-10")
+    return households.compliance_report(conn, me_id, month)
+
+
+@api.post("/households/me/compliance")
+def subscribe_compliance(me_id: int = Depends(require_household), conn=Depends(db)):
+    h = households.household(conn, me_id)
+    if h["kind"] != "bulk":
+        raise ApiError(404, "Compliance reports are for bulk waste generators")
+    revenue.compliance_subscribe(conn, me_id)
+    return households.compliance_report(conn, me_id)
+
+
+# ---------- Dealer Pro ----------
+
+@api.get("/dealers/me/plan")
+def my_dealer_plan(me_id: int = Depends(require_dealer), conn=Depends(db)):
+    return revenue.dealer_plan(conn, me_id)
+
+
+@api.post("/dealers/me/plan")
+def upgrade_dealer_plan(me_id: int = Depends(require_dealer), conn=Depends(db)):
+    return revenue.dealer_upgrade(conn, me_id)
+
+
+@api.get("/dealers/me/bills/{transaction_id}")
+def purchase_bill(transaction_id: int, me_id: int = Depends(require_dealer), conn=Depends(db)):
+    if revenue.dealer_plan(conn, me_id)["plan"] != "pro":
+        raise ApiError(402, "Purchase bills are part of WorthyWaste Pro", rule="needs_pro")
+    bill = revenue.purchase_bill(conn, me_id, transaction_id)
+    if not bill:
+        raise ApiError(404, "Sale not found")
+    return bill
+
+
+# ---------- WorthyWaste team ----------
+
+@api.get("/ops/overview")
+def ops_overview(_ops: int = Depends(require_ops), conn=Depends(db)):
+    return {"revenue": revenue.summary(conn), **households.ward_overview(conn),
+            "dealers_pro": conn.execute("SELECT COUNT(*) FROM dealers WHERE plan = 'pro'").fetchone()[0],
+            "dealers": conn.execute("SELECT COUNT(*) FROM dealers").fetchone()[0],
+            "policies": conn.execute("SELECT COUNT(*) FROM insurance_policies WHERE status = 'active'").fetchone()[0],
+            "bulk_subscribed": conn.execute("SELECT COUNT(*) FROM households WHERE kind = 'bulk' "
+                                            "AND compliance_plan = 1").fetchone()[0]}
+
+
+@api.get("/ops/revenue")
+def ops_revenue(_ops: int = Depends(require_ops), conn=Depends(db)):
+    return {"summary": revenue.summary(conn), "recent": rows(conn.execute(
+        "SELECT * FROM revenue ORDER BY created_at DESC, id DESC LIMIT 50"))}
+
+
+class BillingBody(BaseModel):
+    # Demo only: debit everything now instead of waiting for the notice period and the month end.
+    force: bool = False
+
+
+@api.post("/ops/billing/run")
+def run_billing(body: BillingBody, _ops: int = Depends(require_ops), conn=Depends(db)):
+    """Debit every fee whose notice period is over. A daily cron calls this in the pilot."""
+    if body.force and not auth.demo_mode():
+        raise ApiError(403, "Billing can only be forced in demo mode")
+    return {"paid": households.settle_ready(conn, force=body.force)}
+
+
 # ---------- Satin ----------
 # Every route here needs a Satin branch-staff session (phone + PIN, see /auth/login with role=satin):
 # together they read collectors' personal data, review fraud flags and disburse money.
@@ -807,6 +1018,32 @@ def demo_ivr_confirm(request_id: int, me_id: int = Depends(require_dealer), conn
     req = services.dealer_request(conn, request_id, me_id)
     c = one(conn.execute("SELECT phone FROM collectors WHERE id = ?", (req["collector_id"],)))
     return services.ivr_confirm(conn, request_id=request_id, caller_phone=c["phone"], digit="1")
+
+
+class SimulateDoorScan(BaseModel):
+    household_id: int
+    segregation: str = Field(pattern="^(separated|mixed)$")
+    lat: float
+    lng: float
+
+
+@api.post("/demo/pickups/simulate-scan", status_code=201, dependencies=[Depends(require_demo_mode)])
+def demo_door_scan(body: SimulateDoorScan, me_id: int = Depends(require_collector), conn=Depends(db)):
+    """Stands in for pointing the camera at the door's QR sticker; the token stays on the server."""
+    h = one(conn.execute("SELECT door_qr FROM households WHERE id = ? AND collector_id = ?",
+                         (body.household_id, me_id)))
+    if not h:
+        raise ApiError(404, "Not a door on your route")
+    return households.record_pickup(conn, collector_id=me_id, door_qr=h["door_qr"],
+                                    segregation=body.segregation, lat=body.lat, lng=body.lng)
+
+
+@api.post("/demo/households/me/settle", dependencies=[Depends(require_demo_mode)])
+def demo_settle_now(me_id: int = Depends(require_household), conn=Depends(db)):
+    """Runs tomorrow's AutoPay debit now, so the recording doesn't have to wait a day."""
+    ids = [r["id"] for r in rows(conn.execute(
+        "SELECT id FROM fee_payments WHERE household_id = ? AND status IN ('accrued','due')", (me_id,)))]
+    return households.charge(conn, me_id, ids)
 
 
 app.include_router(api)

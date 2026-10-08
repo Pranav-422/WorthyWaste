@@ -61,6 +61,7 @@ export default function Home() {
             <a href="#how" className="hover:text-ink">How it works</a>
             <a href="#who" className="hover:text-ink">Who it serves</a>
             <a href="#trust" className="hover:text-ink">Fraud checks</a>
+            <a href="#homes" className="hover:text-ink">Households</a>
             <Link href="/satin" className="hover:text-ink">Satin dashboard</Link>
           </div>
           <Link href="/login" className="ml-auto rounded-full bg-ink px-4 py-2 text-sm font-semibold text-white md:ml-2">
@@ -188,6 +189,42 @@ export default function Home() {
         </div>
       </section>
 
+      {/* Phase 2: from the household */}
+      <section id="homes" className="border-y border-line bg-white">
+        <div className="mx-auto max-w-6xl px-4 py-14">
+          <p className="text-sm font-semibold uppercase tracking-wide text-leaf">New · door-to-door collection</p>
+          <h2 className="mt-1 max-w-2xl text-3xl font-bold">From the household, too</h2>
+          <p className="mt-2 max-w-2xl text-slate">
+            The collector scans the QR on the door and marks the waste separated or mixed. The household&apos;s Green Wallet pays
+            the fee by UPI AutoPay, separating earns points that cut the bill, and every pickup becomes the collector&apos;s
+            verified income.
+          </p>
+          <div className="mt-8 grid gap-4 md:grid-cols-3">
+            {[
+              ["Households", "घर / सोसाइटी", ["Green Wallet: AutoPay from your own bank, with a WhatsApp before every debit", "Points for separated waste, redeemed against the fee", "“No pickup today?” — one tap and nothing is charged"]],
+              ["Door-to-door collectors", "घर-घर कलेक्टर", ["Paid for every verified pickup", "Pickups build the same credit score as scrap sales", "Accident and hospital cover"]],
+              ["Societies, hotels, wards", "बल्क जनरेटर / वार्ड", ["Day-by-day compliance report for bulk generators", "Coverage and segregation by ward", "Missed homes flagged after two days"]],
+            ].map(([who, hi, gets]) => (
+              <div key={who as string} className="rounded-3xl border border-line bg-paper p-6">
+                <p className="font-display text-xl font-semibold">{who}</p>
+                <p className="text-sm text-slate">{hi}</p>
+                <ul className="mt-4 space-y-2 text-sm">
+                  {(gets as string[]).map((g) => (
+                    <li key={g} className="flex gap-2">
+                      <CheckIcon className="mt-0.5 h-4 w-4 shrink-0 text-leaf" /> {g}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+          <div className="mt-6 flex flex-wrap gap-3">
+            <Link href="/login?role=household" className="flex h-12 items-center rounded-2xl bg-leaf px-5 font-semibold text-white">Household login</Link>
+            <Link href="/demo/doorstep" className="flex h-12 items-center px-2 font-semibold text-leaf-dark underline underline-offset-4">Watch the doorstep demo</Link>
+          </div>
+        </div>
+      </section>
+
       {/* Trust: fraud + score */}
       <section id="trust" className="bg-ink text-kraft">
         <div className="mx-auto grid max-w-6xl gap-10 px-4 py-14 md:grid-cols-2">
@@ -233,6 +270,7 @@ export default function Home() {
           <div className="flex flex-wrap gap-3">
             <Link href="/login?role=collector" className="flex h-12 items-center rounded-2xl bg-leaf px-5 font-semibold text-white">Collector login</Link>
             <Link href="/login?role=dealer" className="flex h-12 items-center rounded-2xl border-2 border-ink px-5 font-semibold">Dealer login</Link>
+            <Link href="/login?role=household" className="flex h-12 items-center rounded-2xl border-2 border-ink px-5 font-semibold">Household login</Link>
             <Link href="/satin" className="flex h-12 items-center px-2 font-semibold underline underline-offset-4">Satin dashboard</Link>
           </div>
         </div>

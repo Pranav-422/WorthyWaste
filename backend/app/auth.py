@@ -1,7 +1,7 @@
-"""Phone + PIN login for collectors, dealers and Satin branch staff.
+"""Phone + PIN login for collectors, dealers, Satin branch staff, households and the WorthyWaste team.
 
 Sessions are stateless signed tokens kept in an httpOnly cookie per role (ww_collector, ww_dealer,
-ww_satin), so a collector, a dealer and the lender can be signed in side by side on the demo stage.
+ww_satin, ww_household, ww_ops), so everyone in a demo can be signed in side by side in one browser.
 The Next.js server verifies the same tokens (frontend/lib/session.ts), so both must share WW_SECRET.
 
 Token: base64url(JSON {"r": role, "id": id, "exp": unix}) + "." + base64url(HMAC-SHA256(secret, payload))
@@ -14,7 +14,7 @@ import os
 import secrets
 import time
 
-ROLES = ("collector", "dealer", "satin")
+ROLES = ("collector", "dealer", "satin", "household", "ops")
 SESSION_DAYS = 7
 PBKDF2_ROUNDS = 120_000
 DEV_SECRET = "worthywaste-dev-secret-change-me"

@@ -10,10 +10,12 @@ import type {
   CollectorProfile, Material, Message, MyRequest, NearbyDealer, PhotoMismatch, RequestStatus,
   SaleRequest, Transaction,
 } from "@/lib/types";
+import { InsuranceCard } from "@/components/InsuranceCard";
 import { LiveCamera } from "@/components/LiveCamera";
 import { QrCode } from "@/components/QrCode";
 import { ScoreMeter } from "@/components/ScoreMeter";
 import { CheckIcon, Logo, MaterialIcon, SpeakerIcon, StopIcon } from "@/components/icons";
+import { DoorApp } from "./DoorApp";
 
 type Screen = "home" | "sale" | "waiting" | "received";
 type Tab = "card" | "wallet" | "score";
@@ -43,6 +45,8 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
   }, [collectorId]);
 
   if (!profile) return <div className="kraft min-h-dvh grid place-items-center text-slate">…</div>;
+  // Door-to-door collectors (Phase 2) work a route of doors, not sales to a dealer.
+  if (profile.collector.kind === "door_to_door") return <DoorApp profile={profile} demo={demo} reload={load} />;
   const c = profile.collector;
   const mat = (code: string) => materials.find((m) => m.code === code);
   const matLabel = (code: string) => (lang === "hi" ? mat(code)?.label_hi : mat(code)?.label_en) ?? code;
@@ -87,6 +91,7 @@ export function CollectorApp({ collectorId, demo }: { collectorId: number; demo:
             setTab={setTab}
             matLabel={matLabel}
             onNewSale={() => setScreen("sale")}
+            reload={load}
           />
         )}
         {screen === "sale" && (
@@ -211,6 +216,7 @@ function Home({
   setTab,
   matLabel,
   onNewSale,
+  reload,
 }: {
   profile: CollectorProfile;
   lang: Lang;
@@ -218,6 +224,7 @@ function Home({
   setTab: (t: Tab) => void;
   matLabel: (c: string) => string;
   onNewSale: () => void;
+  reload: () => void;
 }) {
   const c = profile.collector;
   const [openedAt] = useState(() => Date.now());
@@ -329,6 +336,7 @@ function Home({
                 ))}
               </ul>
             </div>
+            <InsuranceCard status={profile.insurance} lang={lang} onChanged={reload} />
           </section>
         )}
       </main>

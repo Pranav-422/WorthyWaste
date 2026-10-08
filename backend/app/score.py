@@ -3,6 +3,10 @@
     score = 300 + 600 (0.30 A + 0.25 C + 0.15 T + 0.10 D + 0.20 R)
 
 Weights are v1 assumptions to be recalibrated against pilot repayment data.
+
+Waste pickers earn from verified scrap sales; door-to-door collectors (Phase 2) from verified pickup
+fees. Both count as work: a day with either is an active day, and both are income. Only D differs: a
+waste picker's spread is across dealers, a door-to-door collector's across the homes they serve.
 """
 import json
 import statistics
@@ -14,13 +18,19 @@ WEIGHTS = {"A": 0.30, "C": 0.25, "T": 0.15, "D": 0.10, "R": 0.20}
 
 MIN_DAYS_ON_PLATFORM = 30
 MIN_VERIFIED_SALES = 20
+HOMES_FULL_MARKS = 50
+# Pickup fees count as income once the household has been notified of the debit (accrued) or paid;
+# a disputed pickup (cancelled or refunded) does not count, nor does one the household has not paid.
+EARNED_FEE = "('accrued','paid')"
+
 # First loan ≈ ₹5,000; limit steps up after each cycle repaid on time.
 LOAN_LADDER = [5000, 10000, 15000, 25000]
 # Open flags on these rules hold eligibility until Satin reviews them: each one is about a sale or
 # payment that actually went through. A duplicate photo is blocked before any money moves, so it is
 # shown to Satin but only freezes eligibility once confirmed. photo_mismatch only reaches this list
 # as a pattern (3+ in 7 days) or when the dealer confirmed a different material — never on one AI guess.
-HOLDING_RULES = ("weight_gap", "volume_outlier", "circular_payment", "pair_frequency", "photo_mismatch")
+HOLDING_RULES = ("weight_gap", "volume_outlier", "circular_payment", "pair_frequency", "photo_mismatch",
+                 "pickup_burst", "pickup_disputed")
 
 
 def _clip(x: float) -> float:
@@ -29,16 +39,19 @@ def _clip(x: float) -> float:
 
 def compute_inputs(conn, collector_id: int) -> dict:
     now = clock.now()
-    c = conn.execute("SELECT created_at FROM collectors WHERE id = ?", (collector_id,)).fetchone()
+    c = conn.execute("SELECT created_at, kind FROM collectors WHERE id = ?", (collector_id,)).fetchone()
     if c is None:
         raise KeyError(collector_id)
     joined = clock.parse(c["created_at"])
+    door = c["kind"] == "door_to_door"
 
-    # A — active selling days in the last 30, ÷ 26.
+    # A — active working days in the last 30 (a sale or a verified pickup), ÷ 26.
+    since30 = clock.ts(now - timedelta(days=30))
     active_days = conn.execute(
-        "SELECT COUNT(DISTINCT substr(created_at, 1, 10)) FROM transactions "
-        "WHERE collector_id = ? AND created_at >= ?",
-        (collector_id, clock.ts(now - timedelta(days=30))),
+        "SELECT COUNT(*) FROM (SELECT substr(created_at, 1, 10) AS d FROM transactions "
+        "WHERE collector_id = ? AND created_at >= ? UNION SELECT substr(created_at, 1, 10) FROM pickups "
+        "WHERE collector_id = ? AND status = 'done' AND created_at >= ?) days",
+        (collector_id, since30, collector_id, since30),
     ).fetchone()[0]
     A = _clip(active_days / 26)
 
@@ -53,6 +66,10 @@ def compute_inputs(conn, collector_id: int) -> dict:
         total = conn.execute(
             "SELECT COALESCE(SUM(amount), 0) FROM transactions "
             "WHERE collector_id = ? AND created_at >= ? AND created_at < ?",
+            (collector_id, clock.ts(start), clock.ts(end)),
+        ).fetchone()[0] + conn.execute(
+            f"SELECT COALESCE(SUM(fee), 0) FROM fee_payments WHERE collector_id = ? AND status IN {EARNED_FEE} "
+            "AND created_at >= ? AND created_at < ?",
             (collector_id, clock.ts(start), clock.ts(end)),
         ).fetchone()[0]
         monthly.append(total)
@@ -69,11 +86,21 @@ def compute_inputs(conn, collector_id: int) -> dict:
     days_on = (now - joined).days
     T = _clip((days_on / 30) / 12)
 
-    # D — distinct verified dealers ÷ 3.
-    dealers = conn.execute(
-        "SELECT COUNT(DISTINCT dealer_id) FROM transactions WHERE collector_id = ?", (collector_id,)
-    ).fetchone()[0]
-    D = _clip(dealers / 3)
+    # D — distinct verified dealers ÷ 3; for a door-to-door collector, homes served in 30 days ÷ 50.
+    if door:
+        homes = conn.execute(
+            "SELECT COUNT(DISTINCT household_id) FROM pickups WHERE collector_id = ? AND status = 'done' "
+            "AND created_at >= ?", (collector_id, since30)).fetchone()[0]
+        D = _clip(homes / HOMES_FULL_MARKS)
+        d_input = {"label": "Homes served",
+                   "why": f"Served {homes} homes in the last 30 days (full marks at {HOMES_FULL_MARKS})"}
+    else:
+        dealers = conn.execute(
+            "SELECT COUNT(DISTINCT dealer_id) FROM transactions WHERE collector_id = ?", (collector_id,)
+        ).fetchone()[0]
+        D = _clip(dealers / 3)
+        d_input = {"label": "Dealer spread",
+                   "why": f"Sold to {dealers} verified dealer{'s' if dealers != 1 else ''} (full marks at 3)"}
 
     # R — on-time instalments ÷ due instalments; 0.5 (neutral) before any loan.
     due, on_time = conn.execute(
@@ -85,7 +112,7 @@ def compute_inputs(conn, collector_id: int) -> dict:
 
     return {
         "A": {"value": round(A, 3), "weight": WEIGHTS["A"], "label": "Activity",
-              "why": f"Sold on {active_days} of the last 30 days (target 26)"},
+              "why": f"{'Worked' if door else 'Sold'} on {active_days} of the last 30 days (target 26)"},
         "C": {"value": round(C, 3), "weight": WEIGHTS["C"], "label": "Consistency",
               "why": (f"Monthly income ₹{', ₹'.join(f'{m:,.0f}' for m in reversed(monthly))}; "
                       f"variation {cv:.0%}") if cv is not None
@@ -93,8 +120,7 @@ def compute_inputs(conn, collector_id: int) -> dict:
               "monthly_income": [round(m) for m in reversed(monthly)]},
         "T": {"value": round(T, 3), "weight": WEIGHTS["T"], "label": "Tenure",
               "why": f"{days_on // 30} months {days_on % 30} days on WorthyWaste (full marks at 12 months)"},
-        "D": {"value": round(D, 3), "weight": WEIGHTS["D"], "label": "Dealer spread",
-              "why": f"Sold to {dealers} verified dealer{'s' if dealers != 1 else ''} (full marks at 3)"},
+        "D": {"value": round(D, 3), "weight": WEIGHTS["D"], **d_input},
         "R": {"value": round(R, 3), "weight": WEIGHTS["R"], "label": "Repayment",
               "why": f"{on_time} of {due} instalments on time" if due else "No loan yet — neutral 0.5"},
     }
@@ -127,11 +153,15 @@ def recompute_all(conn) -> int:
 def eligibility(conn, collector_id: int) -> dict:
     """First-loan rule, checked before the score."""
     c = conn.execute(
-        "SELECT created_at, group_id, group_guarantee FROM collectors WHERE id = ?", (collector_id,)
+        "SELECT created_at, group_id, group_guarantee, kind FROM collectors WHERE id = ?", (collector_id,)
     ).fetchone()
     days_on = (clock.now() - clock.parse(c["created_at"])).days
+    door = c["kind"] == "door_to_door"
+    # Verified work: scrap sales, or for a door-to-door collector, days with verified pickups.
     sales = conn.execute(
         "SELECT COUNT(*) FROM transactions WHERE collector_id = ?", (collector_id,)
+    ).fetchone()[0] + conn.execute(
+        "SELECT COUNT(DISTINCT day) FROM pickups WHERE collector_id = ? AND status = 'done'", (collector_id,)
     ).fetchone()[0]
     confirmed_flags = conn.execute(
         "SELECT COUNT(*) FROM fraud_flags WHERE collector_id = ? AND status = 'confirmed'",
@@ -159,7 +189,8 @@ def eligibility(conn, collector_id: int) -> dict:
         {"key": "tenure", "ok": days_on >= MIN_DAYS_ON_PLATFORM,
          "label": f"{MIN_DAYS_ON_PLATFORM}+ days on platform", "detail": f"{days_on} days"},
         {"key": "sales", "ok": sales >= MIN_VERIFIED_SALES,
-         "label": f"{MIN_VERIFIED_SALES}+ verified sales", "detail": f"{sales} sales"},
+         "label": f"{MIN_VERIFIED_SALES}+ " + ("days of verified pickups" if door else "verified sales"),
+         "detail": f"{sales} " + ("days" if door else "sales")},
         {"key": "fraud", "ok": confirmed_flags == 0,
          "label": "No confirmed fraud flag",
          "detail": f"{confirmed_flags} confirmed"},

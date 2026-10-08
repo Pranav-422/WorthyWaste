@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, get, logout, post } from "@/lib/api";
 import { kg, rupees, shortTime, timeAgo } from "@/lib/format";
 import { getLocation, LocationError } from "@/lib/location";
-import type { Batch, Dealer, Material, MassBalance, SaleRequest, Transaction } from "@/lib/types";
+import type { Batch, Dealer, Material, MassBalance, PurchaseBill, SaleRequest, Transaction } from "@/lib/types";
 import { QrScanner } from "@/components/QrScanner";
 import { CheckIcon, Logo, MaterialIcon, QrIcon, ScaleIcon, StopIcon } from "@/components/icons";
 
@@ -153,7 +153,7 @@ export function DealerApp({ dealerId, demo }: { dealerId: number; demo: boolean 
                   onIvr={() => setStep({ kind: "ivr" })}
                 />
               )}
-              {tab === "today" && <Today profile={profile} />}
+              {tab === "today" && <Today profile={profile} onChanged={loadProfile} />}
               {tab === "sell" && <Sell profile={profile} onDone={loadProfile} />}
             </main>
             <nav className="sticky bottom-0 grid grid-cols-3 border-t border-line bg-white">
@@ -765,11 +765,33 @@ function IvrStep({
 
 // ---------- Today ----------
 
-function Today({ profile }: { profile: DealerProfile }) {
+function Today({ profile, onChanged }: { profile: DealerProfile; onChanged: () => void }) {
   const totalKg = profile.today.reduce((s, r) => s + r.kg, 0);
   const totalPaid = profile.today.reduce((s, r) => s + r.paid, 0);
+  const pro = profile.dealer.plan === "pro";
+  const [bill, setBill] = useState<PurchaseBill | null>(null);
+  const [upgrading, setUpgrading] = useState(false);
+  if (bill) return <Bill bill={bill} onClose={() => setBill(null)} />;
   return (
     <div className="space-y-3">
+      {!pro && (
+        <div className="rounded-2xl border-2 border-dashed border-leaf bg-leaf-soft/40 p-4">
+          <p className="font-semibold">WorthyWaste Pro · ₹199/month</p>
+          <p className="text-sm text-slate">A printable purchase bill for every sale, and a monthly stock statement for your recycler and bank.</p>
+          <button
+            disabled={upgrading}
+            onClick={async () => {
+              setUpgrading(true);
+              await post("/dealers/me/plan").catch(() => {});
+              setUpgrading(false);
+              onChanged();
+            }}
+            className="mt-3 h-11 w-full rounded-xl bg-leaf font-semibold text-white disabled:opacity-50"
+          >
+            {upgrading ? "…" : "Start Pro"}
+          </button>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <div className="rounded-2xl bg-ink p-4 text-white">
           <p className="text-xs opacity-70">Bought today</p>
@@ -801,13 +823,76 @@ function Today({ profile }: { profile: DealerProfile }) {
                 {t.label_en} · {timeAgo(t.created_at)}
               </span>
             </span>
-            <span className="text-right tabular">
-              {rupees(t.amount)}
-              <span className="block text-xs text-slate">{kg(t.scale_kg)}</span>
+            <span className="flex items-center gap-3">
+              <span className="text-right tabular">
+                {rupees(t.amount)}
+                <span className="block text-xs text-slate">{kg(t.scale_kg)}</span>
+              </span>
+              {pro && (
+                <button
+                  onClick={() => get<PurchaseBill>(`/dealers/me/bills/${t.id}`).then(setBill).catch(() => {})}
+                  className="rounded-lg border border-line px-2 py-1 text-xs font-semibold"
+                >
+                  Bill
+                </button>
+              )}
             </span>
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/** A purchase bill for one sale (Pro). Printable straight from the browser. */
+function Bill({ bill, onClose }: { bill: PurchaseBill; onClose: () => void }) {
+  return (
+    <div className="space-y-3">
+      <div className="rounded-2xl border border-line bg-white p-5 text-sm">
+        <div className="flex items-start justify-between">
+          <div>
+            <p className="font-display text-xl font-semibold">{bill.shop_name}</p>
+            <p className="text-slate">{bill.owner_name}</p>
+          </div>
+          <div className="text-right">
+            <p className="text-xs uppercase tracking-wide text-slate">Purchase bill</p>
+            <p className="font-mono font-semibold">{bill.bill_no}</p>
+            <p className="text-slate">{new Date(bill.created_at.replace(" ", "T") + "Z").toLocaleString("en-IN")}</p>
+          </div>
+        </div>
+        <p className="mt-4">
+          Bought from <b>{bill.collector_name}</b>
+        </p>
+        <table className="mt-3 w-full">
+          <thead className="text-left text-xs uppercase text-slate">
+            <tr>
+              <th className="py-1 font-medium">Item</th>
+              <th className="text-right font-medium">Weight</th>
+              <th className="text-right font-medium">Rate</th>
+              <th className="text-right font-medium">Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr className="border-t border-line">
+              <td className="py-2">{bill.label_en}</td>
+              <td className="text-right tabular">{kg(bill.scale_kg)}</td>
+              <td className="text-right tabular">₹{bill.rate_per_kg}/kg</td>
+              <td className="text-right font-semibold tabular">{rupees(bill.amount)}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="mt-3 text-xs text-slate">
+          Paid by UPI · {bill.upi_ref} · weight from the connected scale · verified on WorthyWaste
+        </p>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={onClose} className="h-12 flex-1 rounded-xl border border-line font-semibold">
+          Back
+        </button>
+        <button onClick={() => window.print()} className="h-12 flex-[2] rounded-xl bg-ink font-semibold text-white">
+          Print / share
+        </button>
+      </div>
     </div>
   );
 }

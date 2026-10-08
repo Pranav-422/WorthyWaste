@@ -13,9 +13,10 @@ DB_PATH = Path(os.environ.get("WW_DB", DATA_DIR / "worthywaste.db"))
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 
 # Tables in dependency order (referenced tables first). Used for schema, wipe and copy.
-TABLES = ["groups", "collectors", "dealers", "satin_users", "materials", "sale_requests", "photos", "payments",
-          "upi_events", "recycler_sales", "batches", "transactions", "scores", "loans", "fraud_flags",
-          "messages"]
+TABLES = ["groups", "collectors", "dealers", "satin_users", "ops_users", "materials", "sale_requests", "photos",
+          "payments", "upi_events", "recycler_sales", "batches", "transactions", "scores", "loans", "fraud_flags",
+          "messages", "households", "pickups", "fee_payments", "points_events", "household_messages",
+          "insurance_policies", "revenue"]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -39,6 +40,9 @@ CREATE TABLE IF NOT EXISTS collectors (
   upi_vpa        TEXT,
   basic_phone    INTEGER NOT NULL DEFAULT 0,
   equipment      TEXT NOT NULL DEFAULT 'hand_cart',
+  -- waste_picker: sells scrap to dealers (Phase 1). door_to_door: collects household garbage on a
+  -- fixed route and is paid a fee per pickup (Phase 2). Both build the same kind of score.
+  kind           TEXT NOT NULL DEFAULT 'waste_picker',
   credits        INTEGER NOT NULL DEFAULT 0,
   consent_at     TEXT,
   created_at     TEXT NOT NULL
@@ -56,6 +60,8 @@ CREATE TABLE IF NOT EXISTS dealers (
   upi_vpa     TEXT,
   reputation  INTEGER NOT NULL DEFAULT 80,
   location_set_at TEXT,             -- when the dealer last set the shop's location from their phone
+  plan        TEXT NOT NULL DEFAULT 'free',   -- free | pro (paid: purchase bills, monthly statement)
+  plan_since  TEXT,
   created_at  TEXT NOT NULL
 );
 
@@ -67,6 +73,15 @@ CREATE TABLE IF NOT EXISTS satin_users (
   phone      TEXT NOT NULL UNIQUE,
   pin_hash   TEXT,
   branch     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- The WorthyWaste team: revenue, ward coverage and month-end billing. Same login as everyone else.
+CREATE TABLE IF NOT EXISTS ops_users (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  phone      TEXT NOT NULL UNIQUE,
+  pin_hash   TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -218,6 +233,124 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at   TEXT NOT NULL
 );
 
+-- ---------- Phase 2: households and door-to-door collection ----------
+
+-- A home or a bulk waste generator (RWA society, hotel, office). Identified by the QR on its door and
+-- an address, a contact name is optional.
+CREATE TABLE IF NOT EXISTS households (
+  id             INTEGER PRIMARY KEY,
+  kind           TEXT NOT NULL DEFAULT 'home',      -- home | bulk
+  name           TEXT NOT NULL,                     -- what is on the door, e.g. "B-204, Shanti Apartments"
+  contact_name   TEXT,
+  phone          TEXT NOT NULL UNIQUE,
+  pin_hash       TEXT,
+  language       TEXT NOT NULL DEFAULT 'hi',
+  ward           TEXT NOT NULL,
+  lat            REAL NOT NULL,
+  lng            REAL NOT NULL,
+  door_qr        TEXT NOT NULL UNIQUE,
+  collector_id   INTEGER REFERENCES collectors(id), -- whose route this door is on
+  fee_plan       TEXT NOT NULL DEFAULT 'per_pickup', -- per_pickup | monthly
+  fee_per_pickup REAL NOT NULL,
+  monthly_fee    REAL NOT NULL,
+  -- Green Wallet. We never hold the money: it is a UPI AutoPay mandate on the household's own bank
+  -- account, debited per verified pickup (or once a month), up to a monthly limit they set.
+  mandate_vpa    TEXT,
+  mandate_status TEXT NOT NULL DEFAULT 'none',      -- active | none
+  mandate_limit  REAL NOT NULL DEFAULT 0,
+  points         INTEGER NOT NULL DEFAULT 0,
+  fee_credit     REAL NOT NULL DEFAULT 0,           -- rupees from redeemed points, used before the mandate
+  compliance_plan INTEGER NOT NULL DEFAULT 0,       -- bulk generators: paid monthly compliance report
+  created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pickups (
+  id            INTEGER PRIMARY KEY,
+  household_id  INTEGER NOT NULL REFERENCES households(id),
+  collector_id  INTEGER NOT NULL REFERENCES collectors(id),
+  day           TEXT NOT NULL,                      -- India date, YYYY-MM-DD: one pickup per door per day
+  segregation   TEXT NOT NULL,                      -- separated | mixed
+  photo_url     TEXT,
+  photo_phash   TEXT,
+  lat           REAL NOT NULL,
+  lng           REAL NOT NULL,
+  distance_m    REAL NOT NULL,
+  points        INTEGER NOT NULL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'done',       -- done | disputed
+  dispute_reason TEXT,
+  disputed_at   TEXT,
+  created_at    TEXT NOT NULL,
+  UNIQUE (household_id, day)
+);
+
+-- The collector's fee for one pickup and how the household paid for it.
+CREATE TABLE IF NOT EXISTS fee_payments (
+  id            INTEGER PRIMARY KEY,
+  household_id  INTEGER NOT NULL REFERENCES households(id),
+  collector_id  INTEGER NOT NULL REFERENCES collectors(id),
+  pickup_id     INTEGER NOT NULL UNIQUE REFERENCES pickups(id),
+  day           TEXT NOT NULL,
+  plan          TEXT NOT NULL,                      -- the household's plan when the pickup happened
+  fee           REAL NOT NULL,                      -- goes to the collector, in full
+  platform_fee  REAL NOT NULL,                      -- ours
+  credit_used   REAL NOT NULL DEFAULT 0,            -- paid from redeemed points instead of the mandate
+  debited       REAL NOT NULL DEFAULT 0,            -- taken from the household's bank by the mandate
+  -- accrued: notified, waiting for the debit date (next day, or month end on the monthly plan)
+  -- due: the mandate is missing or over its limit, paid, cancelled: disputed before the debit,
+  -- refunded: disputed after it
+  status        TEXT NOT NULL,
+  upi_ref       TEXT,
+  created_at    TEXT NOT NULL,
+  paid_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS points_events (
+  id           INTEGER PRIMARY KEY,
+  household_id INTEGER NOT NULL REFERENCES households(id),
+  pickup_id    INTEGER REFERENCES pickups(id),
+  reason       TEXT NOT NULL,                       -- separated | streak | redeemed | reversed
+  points       INTEGER NOT NULL,                    -- negative when spent or taken back
+  created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS household_messages (
+  id           INTEGER PRIMARY KEY,
+  household_id INTEGER NOT NULL REFERENCES households(id),
+  channel      TEXT NOT NULL,                       -- whatsapp
+  language     TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
+-- Accident and hospital cover sold through a partner insurer, we earn a commission on premiums.
+CREATE TABLE IF NOT EXISTS insurance_policies (
+  id              INTEGER PRIMARY KEY,
+  collector_id    INTEGER NOT NULL REFERENCES collectors(id),
+  partner         TEXT NOT NULL,
+  cover           REAL NOT NULL,
+  monthly_premium REAL NOT NULL,
+  commission_pct  REAL NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'active',   -- active | cancelled
+  started_at      TEXT NOT NULL
+);
+
+-- Every rupee WorthyWaste earns, by stream. Rewards paid for households' points are a cost, so
+-- they are stored as negative amounts.
+CREATE TABLE IF NOT EXISTS revenue (
+  id         INTEGER PRIMARY KEY,
+  stream     TEXT NOT NULL,     -- pickup_fee | loan_lead | compliance | dealer_pro | insurance | rewards
+  amount     REAL NOT NULL,
+  ref_type   TEXT,
+  ref_id     INTEGER,
+  note       TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pickup_collector ON pickups(collector_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pickup_household ON pickups(household_id, day);
+CREATE INDEX IF NOT EXISTS idx_fee_household ON fee_payments(household_id, status);
+CREATE INDEX IF NOT EXISTS idx_fee_collector ON fee_payments(collector_id, day);
+CREATE INDEX IF NOT EXISTS idx_revenue_stream ON revenue(stream, created_at);
 CREATE INDEX IF NOT EXISTS idx_tx_collector ON transactions(collector_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tx_dealer ON transactions(dealer_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_req_status ON sale_requests(status);
@@ -239,6 +372,9 @@ MIGRATIONS = [
     ("sale_requests", "ai_notes", "TEXT"),
     ("sale_requests", "ai_real_scene", "INTEGER"),
     ("sale_requests", "dealer_material", "TEXT"),
+    ("collectors", "kind", "TEXT NOT NULL DEFAULT 'waste_picker'"),
+    ("dealers", "plan", "TEXT NOT NULL DEFAULT 'free'"),
+    ("dealers", "plan_since", "TEXT"),
 ]
 
 MATERIALS = [
@@ -305,8 +441,10 @@ class Cursor:
 
 
 _INSERT_TABLE = re.compile(r"^\s*INSERT\s+INTO\s+(\w+)", re.IGNORECASE)
-_ID_TABLES = {"groups", "collectors", "dealers", "satin_users", "sale_requests", "payments", "upi_events",
-              "recycler_sales", "batches", "transactions", "loans", "fraud_flags", "messages"}
+_ID_TABLES = {"groups", "collectors", "dealers", "satin_users", "ops_users", "sale_requests", "payments",
+              "upi_events", "recycler_sales", "batches", "transactions", "loans", "fraud_flags", "messages",
+              "households", "pickups", "fee_payments", "points_events", "household_messages",
+              "insurance_policies", "revenue"}
 
 
 class Database:
