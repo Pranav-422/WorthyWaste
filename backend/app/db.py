@@ -279,6 +279,12 @@ CREATE TABLE IF NOT EXISTS pickups (
   status        TEXT NOT NULL DEFAULT 'done',       -- done | disputed
   dispute_reason TEXT,
   disputed_at   TEXT,
+  -- The vision agent's run (vision/ on AWS): its id, what it did, how sure it was. review is 'pending'
+  -- while a person has to decide (points held), then 'mixed' or 'separated'.
+  vision_run_id TEXT,
+  vision_action TEXT,
+  vision_confidence REAL,
+  review        TEXT,
   created_at    TEXT NOT NULL,
   UNIQUE (household_id, day)
 );
@@ -375,6 +381,10 @@ MIGRATIONS = [
     ("collectors", "kind", "TEXT NOT NULL DEFAULT 'waste_picker'"),
     ("dealers", "plan", "TEXT NOT NULL DEFAULT 'free'"),
     ("dealers", "plan_since", "TEXT"),
+    ("pickups", "vision_run_id", "TEXT"),
+    ("pickups", "vision_action", "TEXT"),
+    ("pickups", "vision_confidence", "REAL"),
+    ("pickups", "review", "TEXT"),
 ]
 
 MATERIALS = [
@@ -540,6 +550,12 @@ def init_db(db: Database) -> None:
     for table, column, kind in MIGRATIONS:
         if column not in db.columns(table):
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {_pg_schema(kind) if db.is_pg else kind}")
+    # One active policy per collector, so a double tap on two instances cannot enrol (and bill) twice. An older
+    # database may already hold such doubles; keep the first, or creating the index would stop the API starting.
+    db.execute("UPDATE insurance_policies SET status = 'cancelled' WHERE status = 'active' AND id NOT IN "
+               "(SELECT MIN(id) FROM insurance_policies WHERE status = 'active' GROUP BY collector_id)")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_active ON insurance_policies(collector_id) "
+               "WHERE status = 'active'")
     db.executemany(
         "INSERT INTO materials (code, sort_order, label_en, label_hi, rate_per_kg, co2e_per_kg) "
         "VALUES (?,?,?,?,?,?) ON CONFLICT (code) DO UPDATE SET sort_order = excluded.sort_order, "

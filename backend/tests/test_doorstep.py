@@ -1,11 +1,12 @@
 """Phase 2: door-to-door pickups, the household's Green Wallet (UPI AutoPay), points, disputes, and
 the pilot revenue streams."""
 import hashlib
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app import households, main, revenue
+from app import clock, fraud, households, main, revenue
 from tests.conftest import (DEMO_KEY_HEADER, MEENA_PHONE, RAJU, RAJU_PHONE, SATIN_PHONE, env, ids, login,
                             photo, reset)
 
@@ -339,3 +340,84 @@ def test_reset_still_works(client):
     assert r.status_code == 200
     login(client, "dealer", RAJU_PHONE)
     assert client.get("/api/dealers/me/plan").json()["plan"] == "pro"
+
+
+# ---------- review fixes ----------
+
+def _old_pickup(conn, hid, cid, day, segregation="separated", status="done"):
+    conn.execute(
+        "INSERT INTO pickups (household_id, collector_id, day, segregation, lat, lng, distance_m, status, "
+        "disputed_at, created_at) VALUES (?,?,?,?,?,?,0,?,?,?)",
+        (hid, cid, day, segregation, RAJU[0], RAJU[1], status,
+         clock.ts() if status == "disputed" else None, day + " 06:00:00"))
+
+
+def test_streak_keeps_counting_past_two_months(client):
+    fresh_home("9814900101")
+    hid = household_id("9814900101")
+    sunil = main._db.execute("SELECT id FROM collectors WHERE phone = ?", (SUNIL_PHONE,)).fetchone()[0]
+    start = date(2025, 1, 1)
+    with main._tx() as conn:
+        _old_pickup(conn, hid, sunil, start.isoformat(), "mixed")
+        for i in range(1, 64):
+            _old_pickup(conn, hid, sunil, (start + timedelta(days=i)).isoformat())
+        assert households.streak(conn, hid) == 63  # the 63rd in a row earns the bonus again
+
+
+def test_one_household_cannot_freeze_a_collector(client):
+    fresh_home("9814900102")
+    hid = household_id("9814900102")
+    vikas = main._db.execute("SELECT id FROM collectors WHERE phone = ?", (VIKAS_PHONE,)).fetchone()[0]
+    with main._tx() as conn:
+        for d in ("2026-01-02", "2026-01-03", "2026-01-04"):
+            _old_pickup(conn, hid, vikas, d, status="disputed")
+        assert fraud.check_pickup_disputes(conn, vikas) is None
+
+
+def test_compliance_log_is_the_paid_part(client):
+    hotel = household_id(HOTEL_PHONE)
+    login(client, "household", HOTEL_PHONE)
+    with main._tx() as conn:
+        conn.execute("UPDATE households SET compliance_plan = 0 WHERE id = ?", (hotel,))
+    try:
+        rep = client.get("/api/households/me/compliance").json()
+        assert not rep["subscribed"] and rep["log"] == []
+    finally:
+        with main._tx() as conn:
+            conn.execute("UPDATE households SET compliance_plan = 1 WHERE id = ?", (hotel,))
+    for bad in ("2026-13", "2099-01"):
+        assert client.get(f"/api/households/me/compliance?month={bad}").status_code == 400
+
+
+def test_a_second_billing_run_does_not_spend_the_credit_again(client, monkeypatch):
+    """Two instances both read the same ready fees; the one that loses the guarded UPDATE must not
+    touch the credit or book revenue."""
+    qr = fresh_home("9814900103")
+    hid = household_id("9814900103")
+    login(client, "collector", SUNIL_PHONE)
+    fid = scan(client, qr).json()["fee"]["id"]
+    with main._tx() as conn:
+        conn.execute("UPDATE households SET fee_credit = 3 WHERE id = ?", (hid,))
+        stale = households.rows(conn.execute("SELECT * FROM fee_payments WHERE id = ?", (fid,)))
+        conn.execute("UPDATE fee_payments SET status = 'paid' WHERE id = ?", (fid,))  # the other run won
+        before = conn.execute("SELECT COUNT(*) FROM revenue").fetchone()[0]
+        real_rows = households.rows
+        monkeypatch.setattr(households, "rows", lambda cur: stale)
+        r = households.charge(conn, hid, [fid])
+        monkeypatch.setattr(households, "rows", real_rows)
+        assert r["paid"] == 0
+        assert conn.execute("SELECT fee_credit FROM households WHERE id = ?", (hid,)).fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM revenue").fetchone()[0] == before
+
+
+def test_dealer_upgrade_bills_once(client):
+    gupta = main._db.execute("SELECT id FROM dealers WHERE phone = ?", (GUPTA_PHONE,)).fetchone()
+    with main._tx() as conn:
+        did = gupta[0]
+        conn.execute("UPDATE dealers SET plan = 'free' WHERE id = ?", (did,))
+        n = lambda: conn.execute("SELECT COUNT(*) FROM revenue WHERE stream = 'dealer_pro' AND ref_id = ?",  # noqa: E731
+                                 (did,)).fetchone()[0]
+        before = n()
+        revenue.dealer_upgrade(conn, did)
+        revenue.dealer_upgrade(conn, did)  # the double tap
+        assert n() == before + 1

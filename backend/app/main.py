@@ -3,10 +3,13 @@
 All routes live under /api: on Vercel the Next.js app and this API share one domain, and Vercel passes
 the original path (/api/...) through to this service. Locally, Next.js proxies /api/* here unchanged.
 """
+import base64
 import hashlib
 import json
+import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 
@@ -18,6 +21,8 @@ from pydantic import BaseModel, Field, ValidationError
 from . import adapters, auth, clock, fraud, households, revenue, score, services
 from .db import DATABASE_URL, connect, init_db, one, rows, transaction
 from .services import ApiError
+
+log = logging.getLogger("worthywaste.main")
 
 _db = connect()
 # One connection per instance, guarded by a lock. A plain Lock, not an RLock: FastAPI may run a sync
@@ -263,6 +268,9 @@ def health():
             # A photo check that has quietly stopped working looks exactly like one that finds
             # nothing wrong, so the last latency and the last failure are on the health page.
             **adapters.photo_check_status(),
+            "vision": adapters.vision is not None,
+            "vision_last_ms": getattr(adapters.vision, "last_ms", None),
+            "vision_last_error": getattr(adapters.vision, "last_error", None),
             "db": "postgres" if _db.is_pg else "sqlite"}
 
 
@@ -686,21 +694,46 @@ async def create_pickup(
     request: Request,
     door_qr: str = Form(...), segregation: str = Form(...),
     lat: float | None = Form(None), lng: float | None = Form(None),
-    photo: UploadFile | None = File(None),
+    photo: UploadFile | None = File(None), attempt: int = Form(1, ge=1, le=10),
 ):
-    """The collector scanned a door's QR. The photo (of the separated dry waste) is optional; when it
-    comes, it is re-encoded (EXIF and its GPS stripped) and hashed before the lock is taken."""
+    """The collector scanned a door's QR. The photo (of the waste) is optional; when it comes, it is
+    re-encoded (EXIF and its GPS stripped) and hashed before the lock is taken, and the vision agent
+    checks it: a photo it cannot judge comes back 422 "recapture" and nothing is recorded."""
     me_id = require_collector(request)
-    prepared = None
+    prepared = vision = None
     if photo is not None:
         data = await photo.read()
         if len(data) > 4_000_000:
             raise ApiError(413, "Photo too large")
         if data:
             prepared = await run_in_threadpool(_pickup_photo, data)
+    if prepared and segregation in ("separated", "mixed"):
+        with _tx() as conn:  # a scan that will be refused (wrong door, too far, done today) never reaches AWS
+            households.check_door(conn, collector_id=me_id, door_qr=door_qr, lat=lat, lng=lng, phash_hex=prepared[1])
+        vision = await run_in_threadpool(_vision_pickup, prepared[0], segregation, attempt, me_id, door_qr)
+        if vision and vision.get("safe_b64"):  # store the face-blurred copy, not the original
+            prepared = (base64.b64decode(vision.pop("safe_b64")), prepared[1])
+        if vision and vision["action"] == "recapture":
+            raise ApiError(422, vision["message"], rule="recapture", evidence={
+                "run_id": vision["run_id"], "attempt": attempt, "image_urls": vision.get("image_urls"),
+                "trace": vision["trace"]})
     with _tx() as conn:
         return households.record_pickup(conn, collector_id=me_id, door_qr=door_qr, segregation=segregation,
-                                         lat=lat, lng=lng, photo=prepared)
+                                         lat=lat, lng=lng, photo=prepared, vision=vision)
+
+
+def _vision_pickup(jpeg: bytes, marked: str, attempt: int, collector_id: int, door_qr: str) -> dict | None:
+    """The agent's run, or its fallback when the Lambda cannot be reached: record as marked, hold the points."""
+    if adapters.vision is None:
+        return None
+    try:
+        return adapters.vision.analyze(jpeg, marked=marked, attempt=attempt, source="pickup", return_safe=True,
+                                       ref={"collector_id": collector_id, "door": door_qr[-4:]})
+    except adapters.VisionError as e:
+        return {"run_id": None, "action": "accept_unverified", "segregation": marked, "result": None,
+                "message": "Vision unavailable: recorded as marked, points held for review",
+                "trace": [{"kind": "perception", "title": "Vision failed", "error": str(e)[:200]},
+                          {"kind": "decision", "title": "Fall back: record what the collector marked, hold points"}]}
 
 
 @api.get("/collectors/me/insurance")
@@ -770,7 +803,8 @@ def my_compliance(month: str | None = None, me_id: int = Depends(require_househo
     h = households.household(conn, me_id)
     if h["kind"] != "bulk":
         raise ApiError(404, "Compliance reports are for bulk waste generators")
-    if month is not None and not (len(month) == 7 and month[4] == "-" and month.replace("-", "").isdigit()):
+    if month is not None and not (len(month) == 7 and month[4] == "-" and month.replace("-", "").isdigit()
+                                  and 1 <= int(month[5:]) <= 12 and month <= clock.ist_day()[:7]):
         raise ApiError(400, "Month must look like 2026-10")
     return households.compliance_report(conn, me_id, month)
 
@@ -804,6 +838,113 @@ def purchase_bill(transaction_id: int, me_id: int = Depends(require_dealer), con
     if not bill:
         raise ApiError(404, "Sale not found")
     return bill
+
+
+# ---------- Vision: public demo, and the WorthyWaste team's review queue ----------
+
+_vision_calls: dict[str, list[float]] = {}
+VISION_PER_10_MIN = 30
+
+
+def _vision_or_503():
+    if adapters.vision is None:
+        raise ApiError(503, "Vision is not configured on this server (WW_VISION_URL)", rule="vision_off")
+    return adapters.vision
+
+
+def _vision_call(method: str, path: str, body: dict | None = None) -> dict:
+    try:
+        return _vision_or_503().call(method, path, body)
+    except adapters.VisionError as e:
+        status = 404 if str(e).startswith("404") else 409 if str(e).startswith("409") else 502
+        raise ApiError(status, "Vision service: " + str(e)[:120], rule="vision_error")
+
+
+@api.post("/vision/analyze")
+async def vision_analyze(request: Request, photo: UploadFile = File(...), marked: str | None = Form(None),
+                         attempt: int = Form(1, ge=1, le=10)):
+    """Anyone can try the pipeline (the judges' live endpoint). Rate-limited per IP; photos are re-encoded
+    (EXIF stripped) here and face-blurred on AWS before anything is stored."""
+    ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "?")).split(",")[0]
+    now = time.time()
+    # shortcut: per-instance limiter like the login one; a shared store is needed if abuse shows up.
+    recent = [t for t in _vision_calls.get(ip, []) if now - t < 600]
+    if len(recent) >= VISION_PER_10_MIN:
+        raise ApiError(429, "Too many photos from here. Try again in a few minutes.")
+    _vision_calls[ip] = recent + [now]
+    data = await photo.read()
+    if not data or len(data) > 6_000_000:
+        raise ApiError(413 if data else 400, "Photo missing or too large (6 MB max)")
+    try:
+        clean = await run_in_threadpool(adapters.reencode_jpeg, data)
+    except Exception:
+        clean = data  # not an image: the pipeline reports bad_input and the agent asks for a retake
+    vision = _vision_or_503()
+    try:
+        return await run_in_threadpool(lambda: vision.analyze(
+            clean, marked=marked if marked in ("separated", "mixed") else None, attempt=attempt, source="demo"))
+    except adapters.VisionError as e:
+        raise ApiError(502, "Vision service unavailable — try again", rule="vision_error",
+                       evidence={"detail": str(e)[:120]})
+
+
+def _demo_run(run_id: str) -> dict:
+    run = _vision_call("GET", f"/runs/{run_id}")
+    if run.get("source") != "demo":
+        raise ApiError(404, "Run not found")
+    return run
+
+
+@api.get("/vision/runs/{run_id}")
+def vision_run(run_id: str, request: Request):
+    """Demo runs are public by their (random) id; pickup runs only for the WorthyWaste team."""
+    if _session(request, "ops") is None:
+        return _demo_run(run_id)
+    return _vision_call("GET", f"/runs/{run_id}")
+
+
+class VisionReviewBody(BaseModel):
+    approve: bool
+    note: str | None = Field(None, max_length=200)
+
+
+@api.post("/vision/runs/{run_id}/review")
+def vision_review_demo(run_id: str, body: VisionReviewBody):
+    """Human-in-the-loop on the public demo page: a visitor plays the reviewer for their own demo run."""
+    _demo_run(run_id)
+    return _vision_call("POST", f"/runs/{run_id}/review", {"approve": body.approve, "reviewer": "demo visitor",
+                                                          "note": body.note})
+
+
+@api.delete("/vision/runs/{run_id}")
+def vision_delete_demo(run_id: str):
+    """Delete my data: the run and both stored photos."""
+    _demo_run(run_id)
+    return _vision_call("DELETE", f"/runs/{run_id}")
+
+
+@api.get("/ops/reviews")
+def ops_reviews(_ops: int = Depends(require_ops), conn=Depends(db)):
+    return households.pending_reviews(conn)
+
+
+class PickupReviewBody(BaseModel):
+    mixed: bool  # True: the reviewer agrees with the camera
+    note: str | None = Field(None, max_length=200)
+
+
+@api.post("/ops/reviews/{pickup_id}")
+def ops_review(pickup_id: int, body: PickupReviewBody, ops_id: int = Depends(require_ops)):
+    with _tx() as conn:
+        p = households.review_pickup(conn, pickup_id, mixed=body.mixed)
+        reviewer = one(conn.execute("SELECT name FROM ops_users WHERE id = ?", (ops_id,)))
+    if p.get("vision_run_id") and adapters.vision is not None:
+        try:  # the run's trace gets the human step; the pickup is already decided either way
+            adapters.vision.call("POST", f"/runs/{p['vision_run_id']}/review", {
+                "approve": body.mixed, "reviewer": (reviewer or {}).get("name", "ops"), "note": body.note})
+        except adapters.VisionError as e:
+            log.warning("vision review not recorded for run %s: %s", p["vision_run_id"], e)
+    return p
 
 
 # ---------- WorthyWaste team ----------

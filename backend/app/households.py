@@ -73,11 +73,10 @@ def money(x: float) -> str:
 
 # ---------- the pickup ----------
 
-def record_pickup(conn, *, collector_id: int, door_qr: str, segregation: str, lat: float | None,
-                  lng: float | None, photo: tuple[bytes, str] | None = None, notify: bool = True) -> dict:
-    """`photo` is (re-encoded JPEG, perceptual hash), prepared by the caller outside the transaction."""
-    if segregation not in ("separated", "mixed"):
-        raise ApiError(400, "Mark the waste as separated or mixed")
+def check_door(conn, *, collector_id: int, door_qr: str, lat: float | None, lng: float | None,
+               phash_hex: str | None = None):
+    """Who, which door, at the door, not yet today, not a reused photo. Run before the vision check (so a
+    scan that will be refused never reaches AWS) and again inside the pickup's transaction."""
     c = one(conn.execute("SELECT id, name, kind FROM collectors WHERE id = ?", (collector_id,)))
     if not c or c["kind"] != "door_to_door":
         raise ApiError(403, "Only door-to-door collectors record pickups")
@@ -96,10 +95,7 @@ def record_pickup(conn, *, collector_id: int, door_qr: str, segregation: str, la
     day = clock.ist_day()
     if one(conn.execute("SELECT id FROM pickups WHERE household_id = ? AND day = ?", (h["id"], day))):
         raise ApiError(409, f"{h['name']} was already picked up today", rule="already_picked_today")
-
-    photo_url = phash_hex = None
-    if photo is not None:
-        clean, phash_hex = photo
+    if phash_hex:
         dup = fraud.find_duplicate_pickup_photo(conn, phash_hex)
         if dup:
             flag = lambda cn: fraud.raise_flag(  # noqa: E731
@@ -107,6 +103,25 @@ def record_pickup(conn, *, collector_id: int, door_qr: str, segregation: str, la
                 detail=f"Reused a pickup photo from pickup #{dup['pickup_id']} (hash distance {dup['distance']})",
                 evidence=dup, collector_id=collector_id, dedupe_hours=1)
             raise ApiError(409, "This photo was already used", rule="duplicate_photo", evidence=dup, persist=[flag])
+    return c, h, distance, day
+
+
+def record_pickup(conn, *, collector_id: int, door_qr: str, segregation: str, lat: float | None,
+                  lng: float | None, photo: tuple[bytes, str] | None = None, notify: bool = True,
+                  vision: dict | None = None) -> dict:
+    """`photo` is (re-encoded JPEG, perceptual hash), prepared by the caller outside the transaction.
+    `vision` is the vision agent's run on that photo (vision/lambda_function.py), already past "recapture"."""
+    if segregation not in ("separated", "mixed"):
+        raise ApiError(400, "Mark the waste as separated or mixed")
+    # The agent may keep the collector's mark but hold the points until a person decides.
+    held = bool(vision) and vision["action"] in ("needs_approval", "accept_unverified") and segregation == "separated"
+    if vision and vision.get("segregation") in ("separated", "mixed"):
+        segregation = vision["segregation"]
+    c, h, distance, day = check_door(conn, collector_id=collector_id, door_qr=door_qr, lat=lat, lng=lng,
+                                     phash_hex=photo[1] if photo else None)
+    photo_url = phash_hex = None
+    if photo is not None:
+        clean, phash_hex = photo
         name = f"{uuid.uuid4().hex}.jpg"
         conn.execute("INSERT INTO photos (name, data, created_at) VALUES (?,?,?)", (name, clean, clock.ts()))
         photo_url = f"/api/photos/{name}"
@@ -114,35 +129,73 @@ def record_pickup(conn, *, collector_id: int, door_qr: str, segregation: str, la
     try:
         cur = conn.execute(
             "INSERT INTO pickups (household_id, collector_id, day, segregation, photo_url, photo_phash, lat, lng, "
-            "distance_m, status, created_at) VALUES (?,?,?,?,?,?,?,?,?, 'done', ?)",
+            "distance_m, status, vision_run_id, vision_action, vision_confidence, review, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?, 'done', ?,?,?,?, ?)",
             (h["id"], collector_id, day, segregation, photo_url, phash_hex, lat, lng, round(distance, 1),
-             clock.ts()))
+             (vision or {}).get("run_id"), (vision or {}).get("action"),
+             ((vision or {}).get("result") or {}).get("confidence"), "pending" if held else None, clock.ts()))
     except Exception as e:  # the UNIQUE (household_id, day) guard, when two scans race
         if "unique" in str(e).lower():
             raise ApiError(409, f"{h['name']} was already picked up today", rule="already_picked_today")
         raise
     pickup_id = cur.lastrowid
-    pts = _award_points(conn, h, pickup_id, day) if segregation == "separated" else 0
+    pts = _award_points(conn, h, pickup_id, day) if segregation == "separated" and not held else 0
     fee = _new_fee(conn, h, collector_id, pickup_id, day)
     fraud.check_pickup_burst(conn, collector_id)
     if notify:
-        _notify_pickup(conn, household(conn, h["id"]), c["name"], segregation, pts, fee)
+        _notify_pickup(conn, household(conn, h["id"]), c["name"], segregation, pts, fee, held=held)
         score.recompute(conn, collector_id)
     return {"pickup": one(conn.execute("SELECT * FROM pickups WHERE id = ?", (pickup_id,))),
-            "fee": fee, "points": pts,
+            "fee": fee, "points": pts, "held": held,
+            "vision": {k: vision.get(k) for k in ("run_id", "action", "message", "image_urls", "trace")} if vision else None,
             "household": {"id": h["id"], "name": h["name"], "kind": h["kind"]}}
+
+
+def review_pickup(conn, pickup_id: int, *, mixed: bool) -> dict:
+    """A person's decision on a pickup the vision agent held. Mixed: no points, and the collector gets a
+    flag (they marked it separated). Separated: the held points are released."""
+    p = one(conn.execute("SELECT * FROM pickups WHERE id = ?", (pickup_id,)))
+    if not p:
+        raise ApiError(404, "Pickup not found")
+    # A pickup the household disputed is not reviewed: there is nothing to flag the collector for.
+    cur = conn.execute("UPDATE pickups SET review = ? WHERE id = ? AND review = 'pending' AND status = 'done'",
+                       ("mixed" if mixed else "separated", pickup_id))
+    if cur.rowcount == 0:
+        raise ApiError(409, "Already reviewed")
+    h = household(conn, p["household_id"])
+    hi = h["language"] == "hi"
+    if mixed:
+        conn.execute("UPDATE pickups SET segregation = 'mixed' WHERE id = ?", (pickup_id,))
+        fraud.raise_flag(conn, entity_type="collector", entity_id=p["collector_id"], rule="vision_mismatch",
+                         detail=f"Marked pickup #{pickup_id} separated; the photo and a reviewer say mixed",
+                         evidence={"pickup_id": pickup_id, "vision_run_id": p["vision_run_id"]},
+                         collector_id=p["collector_id"], dedupe_hours=1)
+        send(conn, h, "जाँच में कचरा मिला-जुला पाया गया, इस पिकअप के पॉइंट नहीं मिले। गीला-सूखा अलग रखें।" if hi
+             else "On review your waste was mixed, so no points for this pickup. Keep wet and dry apart.")
+        pts = 0
+    else:
+        pts = _award_points(conn, h, pickup_id, p["day"])
+        send(conn, h, f"जाँच पूरी: कचरा अलग था — +{pts} पॉइंट।" if hi
+             else f"Review done: your waste was separated — +{pts} points.")
+    score.recompute(conn, p["collector_id"])
+    return {**one(conn.execute("SELECT * FROM pickups WHERE id = ?", (pickup_id,))), "points_released": pts}
+
+
+def pending_reviews(conn) -> list[dict]:
+    return rows(conn.execute(
+        "SELECT p.id, p.day, p.segregation, p.vision_run_id, p.vision_action, p.vision_confidence, p.photo_url, "
+        "p.created_at, h.name AS household_name, c.name AS collector_name FROM pickups p "
+        "JOIN households h ON h.id = p.household_id JOIN collectors c ON c.id = p.collector_id "
+        "WHERE p.review = 'pending' AND p.status = 'done' ORDER BY p.id DESC LIMIT 50"))
 
 
 def streak(conn, household_id: int) -> int:
     """Separated pickups in a row, most recent first. Days without a pickup don't break it: the
     household can't help it if the collector took Sunday off."""
-    n = 0
-    for r in conn.execute("SELECT segregation FROM pickups WHERE household_id = ? AND status = 'done' "
-                          "ORDER BY day DESC LIMIT 60", (household_id,)):
-        if r["segregation"] != "separated":
-            break
-        n += 1
-    return n
+    return conn.execute(
+        "SELECT COUNT(*) FROM pickups WHERE household_id = ? AND status = 'done' AND day > COALESCE("
+        "(SELECT MAX(day) FROM pickups WHERE household_id = ? AND status = 'done' AND segregation = 'mixed'), '')",
+        (household_id, household_id)).fetchone()[0]
 
 
 def _award_points(conn, h: dict, pickup_id: int, day: str) -> int:
@@ -181,11 +234,15 @@ def _new_fee(conn, h: dict, collector_id: int, pickup_id: int, day: str) -> dict
     return one(conn.execute("SELECT * FROM fee_payments WHERE id = ?", (cur.lastrowid,)))
 
 
-def _notify_pickup(conn, h: dict, collector_name: str, segregation: str, pts: int, fee: dict) -> None:
+def _notify_pickup(conn, h: dict, collector_name: str, segregation: str, pts: int, fee: dict,
+                   held: bool = False) -> None:
     first = collector_name.split()[0]
     amount = fee["fee"] + fee["platform_fee"]
     hi = h["language"] == "hi"
-    if segregation == "separated":
+    if held:
+        head = ("आज के पिकअप की फ़ोटो जाँच में है — पॉइंट जाँच के बाद मिलेंगे।" if hi
+                else "Today's pickup photo is being checked — points follow the review.")
+    elif segregation == "separated":
         head = (f"आज आपका कचरा अलग मिला — +{pts} पॉइंट।" if hi else f"Your waste was separated today — +{pts} points.")
     else:
         head = ("आज कचरा मिला-जुला था, पॉइंट नहीं मिले। कल गीला-सूखा अलग रखें।" if hi
@@ -237,14 +294,20 @@ def charge(conn, household_id: int, payment_ids: list[int], *, book_fee: bool = 
                          "AND status IN ('accrued','due')", ids)
             return {"paid": 0, "due": len(ids), "debited": 0.0, "credit_used": 0.0, "reason": reason}
     upi_ref = adapters.new_upi_ref() if to_debit > 0 else None
-    left, now = credit, clock.ts()
+    left, now, won = credit, clock.ts(), []
     for f in fees:
         amount = f["fee"] + f["platform_fee"]
         use = min(left, amount)
-        left -= use
-        conn.execute("UPDATE fee_payments SET status = 'paid', credit_used = ?, debited = ?, upi_ref = ?, "
-                     "paid_at = ? WHERE id = ? AND status IN ('accrued','due')",
-                     (round(use, 2), round(amount - use, 2), upi_ref, now, f["id"]))
+        cur = conn.execute("UPDATE fee_payments SET status = 'paid', credit_used = ?, debited = ?, upi_ref = ?, "
+                           "paid_at = ? WHERE id = ? AND status IN ('accrued','due')",
+                           (round(use, 2), round(amount - use, 2), upi_ref, now, f["id"]))
+        if cur.rowcount == 1:  # another billing run (another server instance) may have paid it already
+            left -= use
+            won.append(f)
+    fees, credit = won, round(credit - left, 2)
+    to_debit = round(sum(f["fee"] + f["platform_fee"] for f in fees) - credit, 2)
+    if not fees:
+        return {"paid": 0, "due": 0, "debited": 0.0, "credit_used": 0.0}
     if credit:
         conn.execute("UPDATE households SET fee_credit = fee_credit - ? WHERE id = ?", (credit, household_id))
         revenue.record(conn, "rewards", -credit, ref_type="household", ref_id=household_id,
@@ -446,7 +509,8 @@ def compliance_report(conn, household_id: int, month: str | None = None) -> dict
         "days": len(days), "handed_over": len(done), "separated": separated,
         "separated_pct": round(100 * separated / len(done)) if done else None,
         "missed": [d for d in days if d not in picks or picks[d]["status"] != "done"],
-        "log": [{"day": d, **picks[d]} for d in days if d in picks],
+        # The day-by-day log is the paid part.
+        "log": [{"day": d, **picks[d]} for d in days if d in picks] if h["compliance_plan"] else [],
     }
 
 

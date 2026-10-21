@@ -95,6 +95,9 @@ export default function Home() {
               <Link href="/demo" className="flex h-14 items-center px-2 text-lg font-semibold text-leaf-dark underline underline-offset-4">
                 Watch the live demo →
               </Link>
+              <Link href="/vision" className="flex h-14 items-center px-2 text-lg font-semibold text-leaf-dark underline underline-offset-4">
+                Try the segregation check →
+              </Link>
             </div>
           </div>
 

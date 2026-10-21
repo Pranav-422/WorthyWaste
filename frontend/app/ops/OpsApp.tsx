@@ -3,11 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { ApiError, get, logout, post } from "@/lib/api";
 import { rupees, shortDate, timeAgo } from "@/lib/format";
-import type { OpsOverview } from "@/lib/types";
+import type { OpsOverview, PendingReview, VisionRun } from "@/lib/types";
+import { AgentTrace } from "@/components/AgentTrace";
 import { ColumnChart } from "@/components/BarChart";
 import { Logo } from "@/components/icons";
 
-type View = "revenue" | "wards";
+type View = "revenue" | "wards" | "reviews";
 
 type RevenueRow = { id: number; stream: string; amount: number; note: string | null; created_at: string };
 
@@ -25,11 +26,17 @@ export function OpsApp({ demo }: { demo: boolean }) {
   const [o, setO] = useState<OpsOverview | null>(null);
   const [recent, setRecent] = useState<RevenueRow[]>([]);
   const [note, setNote] = useState<string | null>(null);
+  const [reviews, setReviews] = useState<PendingReview[]>([]);
 
   const refresh = useCallback(async () => {
-    const [ov, rev] = await Promise.all([get<OpsOverview>("/ops/overview"), get<{ recent: RevenueRow[] }>("/ops/revenue")]);
+    const [ov, rev, rq] = await Promise.all([
+      get<OpsOverview>("/ops/overview"),
+      get<{ recent: RevenueRow[] }>("/ops/revenue"),
+      get<PendingReview[]>("/ops/reviews"),
+    ]);
     setO(ov);
     setRecent(rev.recent);
+    setReviews(rq);
   }, []);
   useEffect(() => {
     const first = setTimeout(refresh, 0);
@@ -65,6 +72,7 @@ export function OpsApp({ demo }: { demo: boolean }) {
             [
               ["revenue", "Revenue"],
               ["wards", "Wards & collection"],
+              ["reviews", `Photo reviews${reviews.length ? ` (${reviews.length})` : ""}`],
             ] as const
           ).map(([k, label]) => (
             <button
@@ -85,7 +93,15 @@ export function OpsApp({ demo }: { demo: boolean }) {
 
       <main className="min-w-0 px-4 py-6 lg:px-8">
         {note && <p className="mb-4 rounded-xl bg-ink p-3 text-sm text-kraft">{note}</p>}
-        {!o ? <p className="text-slate">Loading…</p> : view === "revenue" ? <RevenueView o={o} recent={recent} /> : <WardsView o={o} demo={demo} onBill={bill} />}
+        {!o ? (
+          <p className="text-slate">Loading…</p>
+        ) : view === "revenue" ? (
+          <RevenueView o={o} recent={recent} />
+        ) : view === "wards" ? (
+          <WardsView o={o} demo={demo} onBill={bill} />
+        ) : (
+          <ReviewsView reviews={reviews} onDone={(msg) => (setNote(msg), refresh())} />
+        )}
       </main>
     </div>
   );
@@ -283,5 +299,73 @@ function WardsView({ o, demo, onBill }: { o: OpsOverview; demo: boolean; onBill:
         </section>
       </div>
     </>
+  );
+}
+
+/** Pickups the vision agent would not decide alone: the collector said separated, the camera saw mixed. */
+function ReviewsView({ reviews, onDone }: { reviews: PendingReview[]; onDone: (msg: string) => void }) {
+  return (
+    <>
+      <PageTitle title="Photo reviews" sub="The agent holds the household's points and proposes a flag; nothing happens until you decide." />
+      {!reviews.length && <p className="rounded-2xl border border-line bg-white p-4 text-slate">No pickups waiting. </p>}
+      <div className="grid gap-4 xl:grid-cols-2">
+        {reviews.map((r) => (
+          <ReviewCard key={r.id} r={r} onDone={onDone} />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function ReviewCard({ r, onDone }: { r: PendingReview; onDone: (msg: string) => void }) {
+  const [run, setRun] = useState<VisionRun | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (r.vision_run_id) get<VisionRun>(`/vision/runs/${r.vision_run_id}`).then(setRun, () => setRun(null));
+  }, [r.vision_run_id]);
+
+  const decide = async (mixed: boolean) => {
+    setBusy(true);
+    try {
+      const p = await post<{ points_released: number }>(`/ops/reviews/${r.id}`, { mixed });
+      onDone(mixed ? `Pickup #${r.id}: mixed, collector flagged.` : `Pickup #${r.id}: separated, ${p.points_released} points released.`);
+    } catch (e) {
+      onDone((e as ApiError).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const img = run?.image_urls.annotated ?? run?.image_urls.safe ?? r.photo_url ?? undefined;
+  return (
+    <article className="rounded-2xl border border-line bg-white p-4">
+      <p className="font-semibold">
+        #{r.id} · {r.household_name}
+      </p>
+      <p className="text-sm text-slate">
+        {r.collector_name} marked <b>separated</b> · {timeAgo(r.created_at)} ·{" "}
+        {r.vision_action === "accept_unverified" ? "vision unavailable" : `camera ${Math.round((r.vision_confidence ?? 0) * 100)}% sure it is mixed`}
+      </p>
+      {img && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={img} alt="Pickup photo, annotated" className="mt-3 w-full rounded-xl" />
+      )}
+      {run && (
+        <details className="mt-3 text-sm">
+          <summary className="cursor-pointer font-semibold">Agent trace</summary>
+          <div className="mt-2">
+            <AgentTrace trace={run.trace} />
+          </div>
+        </details>
+      )}
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <button disabled={busy} onClick={() => decide(true)} className="h-11 rounded-xl bg-brick font-semibold text-white disabled:opacity-40">
+          Mixed: flag collector
+        </button>
+        <button disabled={busy} onClick={() => decide(false)} className="h-11 rounded-xl border-2 border-ink font-semibold disabled:opacity-40">
+          Separated: release points
+        </button>
+      </div>
+    </article>
   );
 }

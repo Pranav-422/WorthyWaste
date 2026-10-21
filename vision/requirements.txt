@@ -1,0 +1,5 @@
+# Local: train, evaluate, test. The Lambda ships requirements-lambda.txt.
+-r requirements-lambda.txt
+boto3==1.43.116
+onnx==1.23.2  # only to cut MobileNetV2 at its pooling layer (make_features_model.py)
+pytest==9.1.1

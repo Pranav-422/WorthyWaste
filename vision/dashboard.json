@@ -1,0 +1,22 @@
+{
+  "widgets": [
+    {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+      "title": "Vision latency per run (ms)", "region": "{{REGION}}", "view": "timeSeries", "stat": "p50", "period": 300,
+      "metrics": [
+        [{"expression": "SEARCH('{WorthyWaste/Vision,Action} MetricName=\"RunLatencyMs\"', 'p50', 300)", "id": "p50", "label": "p50"}],
+        [{"expression": "SEARCH('{WorthyWaste/Vision,Action} MetricName=\"RunLatencyMs\"', 'p90', 300)", "id": "p90", "label": "p90"}]
+      ]}},
+    {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+      "title": "Agent actions", "region": "{{REGION}}", "view": "timeSeries", "stacked": true, "period": 300,
+      "metrics": [[{"expression": "SEARCH('{WorthyWaste/Vision,Action} MetricName=\"Runs\"', 'Sum', 300)", "id": "a", "label": ""}]]}},
+    {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+      "title": "Lambda: invocations, errors, throttles", "region": "{{REGION}}", "view": "timeSeries", "stat": "Sum", "period": 300,
+      "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "{{NAME}}"], [".", "Errors", ".", "."], [".", "Throttles", ".", "."]]}},
+    {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+      "title": "Lambda duration (ms)", "region": "{{REGION}}", "view": "timeSeries", "period": 300,
+      "metrics": [["AWS/Lambda", "Duration", "FunctionName", "{{NAME}}", {"stat": "p50"}], ["...", {"stat": "p90"}], ["...", {"stat": "Maximum"}]]}},
+    {"type": "log", "x": 0, "y": 12, "width": 24, "height": 6, "properties": {
+      "title": "Recent runs", "region": "{{REGION}}", "view": "table",
+      "query": "SOURCE '/aws/lambda/{{NAME}}' | filter ispresent(Action) | fields @timestamp, Action, RunLatencyMs, PipelineMs, Confidence | sort @timestamp desc | limit 20"}}
+  ]
+}

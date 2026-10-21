@@ -5,7 +5,8 @@ import { ApiError, get, logout, post, postForm } from "@/lib/api";
 import { rupees, shortDate, shortTime } from "@/lib/format";
 import { type Coords, getLocation, LocationError } from "@/lib/location";
 import { speak } from "@/lib/speech";
-import type { CollectorProfile, PickupResult, Route, RouteHome } from "@/lib/types";
+import type { CollectorProfile, PickupResult, Route, RouteHome, TraceStep } from "@/lib/types";
+import { AgentTrace } from "@/components/AgentTrace";
 import { InsuranceCard } from "@/components/InsuranceCard";
 import { LiveCamera } from "@/components/LiveCamera";
 import { QrScanner } from "@/components/QrScanner";
@@ -295,6 +296,9 @@ function MarkPickup({
   const [loc, setLoc] = useState<Coords | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The vision agent asked for a retake: which photo this is, and what it saw on the last one.
+  const [attempt, setAttempt] = useState(1);
+  const [retake, setRetake] = useState<{ annotated?: string; trace: TraceStep[] } | null>(null);
   const simulated = "householdId" in door;
 
   useEffect(() => {
@@ -329,17 +333,26 @@ function MarkPickup({
         f.set("lat", String(loc.lat));
         f.set("lng", String(loc.lng));
         if (photo) f.set("photo", photo.blob, "waste.jpg");
+        f.set("attempt", String(attempt));
         r = await postForm<PickupResult>("/pickups", f);
       }
       onDone(r);
     } catch (e) {
       const err = e as ApiError;
+      if (err.rule === "recapture") {
+        const ev = err.evidence as { image_urls?: Record<string, string>; trace?: TraceStep[] } | undefined;
+        setRetake({ annotated: ev?.image_urls?.annotated ?? ev?.image_urls?.safe, trace: ev?.trace ?? [] });
+        setAttempt((a) => a + 1);
+        setPhoto(null);
+        setCamera(true);
+      }
       const known: Record<string, [string, string]> = {
         already_picked_today: ["इस घर का कचरा आज पहले ही ले लिया गया है", "This door was already picked up today"],
         gps_far_from_home: ["आप इस घर से दूर हैं — दरवाज़े पर जाकर स्कैन करें", "You are too far from this home — scan at the door"],
         not_on_route: ["यह घर आपके राउंड में नहीं है", "This door is not on your route"],
         unknown_door: ["यह QR किसी रजिस्टर्ड घर का नहीं है", "This QR is not a registered door"],
         duplicate_photo: ["यह फ़ोटो पहले इस्तेमाल हो चुकी है — नई फ़ोटो लें", "This photo was already used — take a new one"],
+        recapture: ["फ़ोटो साफ़ नहीं आई — पास से, रोशनी में दोबारा लें", "The camera could not judge this photo — take it again, closer and in light"],
       };
       const k = err.rule ? known[err.rule] : undefined;
       setError(k ? L(lang, k[0], k[1]) : err.message);
@@ -356,6 +369,18 @@ function MarkPickup({
           <StopIcon className="h-7 w-7 shrink-0" />
           <p className="text-lg font-semibold">{error}</p>
         </div>
+      )}
+      {retake && (
+        <details className="rounded-2xl border border-line bg-paper p-3 text-sm">
+          <summary className="cursor-pointer font-semibold">{L(lang, "कैमरे ने क्या देखा", "What the camera saw")}</summary>
+          {retake.annotated && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={retake.annotated} alt="" className="mt-2 w-full rounded-xl" />
+          )}
+          <div className="mt-3">
+            <AgentTrace trace={retake.trace} />
+          </div>
+        </details>
       )}
       <p className="rounded-2xl bg-ink px-4 py-3 text-kraft">
         <span className="text-xs opacity-70">{L(lang, "दरवाज़ा", "Door")}</span>
@@ -400,7 +425,7 @@ function MarkPickup({
             <LiveCamera label={L(lang, "फ़ोटो लें", "Take a photo")} onCapture={(blob, preview) => (setPhoto({ blob, preview }), setCamera(false))} />
           ) : (
             <button onClick={() => setCamera(true)} className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-leaf bg-paper font-semibold text-leaf">
-              📷 {L(lang, "सूखे कचरे की फ़ोटो (ज़रूरी नहीं)", "Photo of the dry waste (optional)")}
+              📷 {L(lang, "कचरे की फ़ोटो — कैमरा जाँचेगा", "Photo of the waste — the camera checks it")}
             </button>
           )}
         </section>
@@ -432,6 +457,11 @@ function Done({ result, lang, onNext, onHome }: { result: PickupResult; lang: La
         <p className="mt-1 text-lg">{sep ? L(lang, "कचरा अलग मिला", "Separated") : L(lang, "मिला-जुला", "Mixed")}</p>
         <p className="mt-4 font-display text-5xl font-extrabold tabular text-marigold">+{rupees(result.fee.fee)}</p>
         <p className="text-sm opacity-90">{L(lang, "आपकी कमाई में जुड़े", "added to your earnings")}</p>
+        {result.held && (
+          <p className="mx-auto mt-3 w-fit rounded-full bg-white/20 px-4 py-1 text-sm font-semibold">
+            {L(lang, "फ़ोटो जाँच में है — पॉइंट बाद में", "Photo sent for review — points after")}
+          </p>
+        )}
         {result.points > 0 && (
           <p className="mx-auto mt-3 w-fit rounded-full bg-white/20 px-4 py-1 text-sm font-semibold">
             {L(lang, `घर को +${result.points} पॉइंट`, `Home earned +${result.points} points`)}

@@ -1,0 +1,113 @@
+{
+  "opencv": "5.0.0",
+  "classifier": {
+    "accuracy": 0.9343,
+    "precision": 0.9396,
+    "recall": 0.9101,
+    "f1": 0.9246,
+    "confusion": {
+      "tp": 1012,
+      "fp": 65,
+      "fn": 100,
+      "tn": 1336
+    },
+    "n": 2513,
+    "positive": "recyclable",
+    "split": "TEST (held out)"
+  },
+  "pipeline": {
+    "accuracy": 0.87,
+    "precision": 0.8675,
+    "recall": 0.8733,
+    "f1": 0.8704,
+    "confusion": {
+      "tp": 131,
+      "fp": 20,
+      "fn": 19,
+      "tn": 130
+    },
+    "n": 300,
+    "positive": "mixed",
+    "by_kind": {
+      "separated_two": {
+        "n": 75,
+        "correct": 63,
+        "accuracy": 0.84
+      },
+      "separated_one": {
+        "n": 75,
+        "correct": 67,
+        "accuracy": 0.8933
+      },
+      "mixed": {
+        "n": 150,
+        "correct": 131,
+        "accuracy": 0.8733
+      }
+    },
+    "mean_confidence_correct": 0.81,
+    "mean_confidence_wrong": 0.66,
+    "agent_actions_when_collector_says_separated": {
+      "accept": 158,
+      "needs_approval": 106,
+      "recapture": 36
+    },
+    "at_agent_thresholds": {
+      "confidence>=0.55 (judged, not retaken)": {
+        "share_of_photos": 0.88,
+        "accuracy": 0.9091,
+        "n": 264
+      },
+      "mixed with confidence>=0.7 (sent to a person)": {
+        "share_of_photos": 0.702,
+        "accuracy": 0.8679,
+        "n": 106
+      }
+    },
+    "latency_ms": {
+      "decode": {
+        "p50": 1.1,
+        "p95": 1.2
+      },
+      "quality": {
+        "p50": 2.9,
+        "p95": 3.4
+      },
+      "colour": {
+        "p50": 9.2,
+        "p95": 10.4
+      },
+      "faces": {
+        "p50": 10.3,
+        "p95": 15.9
+      },
+      "segment": {
+        "p50": 313.6,
+        "p95": 507.6
+      },
+      "superpixels": {
+        "p50": 41.7,
+        "p95": 57.7
+      },
+      "classify": {
+        "p50": 96.6,
+        "p95": 120.9
+      },
+      "annotate": {
+        "p50": 1.6,
+        "p95": 2.1
+      },
+      "total": {
+        "p50": 481.9,
+        "p95": 676.1
+      }
+    }
+  },
+  "quality_gate": {
+    "blurred": 1.0,
+    "dark": 1.0,
+    "garbage": 1.0,
+    "n": 40
+  },
+  "generated_at": "2026-10-21 01:52:36"
+}

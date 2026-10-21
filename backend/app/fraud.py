@@ -362,17 +362,18 @@ def check_pickup_burst(conn, collector_id: int) -> int | None:
 
 
 def check_pickup_disputes(conn, collector_id: int) -> int | None:
-    """One household saying "no pickup today" is recorded on the pickup. Three in a week is a pattern."""
-    n = conn.execute("SELECT COUNT(*) FROM pickups WHERE collector_id = ? AND status = 'disputed' "
+    """One household saying "no pickup today" is recorded on the pickup. Three homes in a week is a pattern;
+    counting homes, not disputes, so one household cannot freeze a collector's loan on its own."""
+    n = conn.execute("SELECT COUNT(DISTINCT household_id) FROM pickups WHERE collector_id = ? AND status = 'disputed' "
                      "AND disputed_at >= ?",
                      (collector_id, clock.ago(days=PICKUP_DISPUTE_WINDOW_DAYS))).fetchone()[0]
     if n < PICKUP_DISPUTE_REPEATS:
         return None
     return raise_flag(
         conn, entity_type="collector", entity_id=collector_id, rule="pickup_disputed",
-        detail=f"Households reported {n} scanned pickups that did not happen in "
+        detail=f"{n} households reported scanned pickups that did not happen in "
                f"{PICKUP_DISPUTE_WINDOW_DAYS} days",
-        evidence={"disputes": n, "window_days": PICKUP_DISPUTE_WINDOW_DAYS}, collector_id=collector_id)
+        evidence={"households": n, "window_days": PICKUP_DISPUTE_WINDOW_DAYS}, collector_id=collector_id)
 
 
 RULE_LABELS = {
@@ -386,4 +387,5 @@ RULE_LABELS = {
     "photo_mismatch": "Photo mismatch",
     "pickup_burst": "Too many doors too fast",
     "pickup_disputed": "Pickups disputed by households",
+    "vision_mismatch": "Photo says mixed",
 }

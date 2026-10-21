@@ -267,7 +267,71 @@ export type PickupResult = {
   pickup: { id: number; segregation: "separated" | "mixed"; day: string; photo_url: string | null };
   fee: { id: number; fee: number; platform_fee: number; plan: "per_pickup" | "monthly"; status: FeeStatus };
   points: number;
+  /** The vision agent held the points for a person to review. */
+  held?: boolean;
+  vision?: { run_id: string | null; action: AgentAction; message: string; image_urls?: Record<string, string>; trace: TraceStep[] } | null;
   household: { id: number; name: string; kind: "home" | "bulk" };
+};
+
+// ---------- Vision (OpenCV pipeline + agent on AWS Lambda) ----------
+
+export type AgentAction = "accept" | "recapture" | "needs_approval" | "accept_unverified";
+
+export type TraceStep = { t?: number; kind: "perception" | "decision" | "action" | "human"; title: string } & Record<string, unknown>;
+
+export type VisionHeap = {
+  box: [number, number, number, number];
+  area_share: number;
+  label: "organic" | "recyclable";
+  minority: number;
+  mixed: boolean;
+  sure_share: number;
+  parts: { box: number[]; label: "organic" | "recyclable"; p: number }[];
+};
+
+export type VisionResult = {
+  status: "ok" | "low_quality" | "bad_input";
+  reason?: string;
+  verdict?: "separated" | "mixed" | null;
+  confidence?: number;
+  quality?: { sharpness: number; brightness: number; problems: string[] };
+  faces_blurred?: number;
+  waste_share?: number;
+  segmentation_fallback?: boolean;
+  heaps?: VisionHeap[];
+  counts?: Record<string, number>;
+  timings_ms: Record<string, number>;
+};
+
+export type VisionRun = {
+  run_id: string;
+  source: "demo" | "pickup";
+  marked: "separated" | "mixed" | null;
+  attempt: number;
+  action: AgentAction;
+  message: string;
+  segregation: "separated" | "mixed" | null;
+  status: "pending_approval" | "closed";
+  outcome?: "separated" | "mixed";
+  result: VisionResult | null;
+  error: string | null;
+  trace: TraceStep[];
+  image_urls: Record<string, string>;
+  latency_ms?: number;
+  created_at: number;
+};
+
+export type PendingReview = {
+  id: number;
+  day: string;
+  segregation: "separated" | "mixed";
+  vision_run_id: string | null;
+  vision_action: AgentAction;
+  vision_confidence: number | null;
+  photo_url: string | null;
+  created_at: string;
+  household_name: string;
+  collector_name: string;
 };
 
 export type HouseholdPickup = {

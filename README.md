@@ -136,6 +136,33 @@ pickups alone.
 
 Existing databases get the new tables at startup but no Phase 2 data: run *Reset demo data* once.
 
+## Phase 3: segregation check (OpenCV 5 on AWS) and the pickup agent
+
+The collector's photo of a home's waste is checked by an OpenCV 5 pipeline on AWS Lambda: **separated or mixed**,
+with an annotated image and a confidence. An agent then decides what happens (perception → decision → action):
+
+| Agent action | When | What happens |
+| --- | --- | --- |
+| `recapture` | bad file, blurry, dark, or confidence < 55% | 422 to the collector app: "take it again"; nothing recorded |
+| `accept` | camera agrees, or the collector marked the safer "mixed" | pickup recorded as usual |
+| `needs_approval` | collector said separated, camera ≥ 70% sure it is mixed | pickup recorded, **points held**, card in `/ops` → Photo reviews; a person decides (mixed → no points + `vision_mismatch` flag; separated → points released) |
+| `accept_unverified` | Lambda down, or 3 photos still not judgeable | recorded as marked, points held for review |
+
+Every step is logged (DynamoDB) and shown as a timeline: on the public page **`/vision`** (upload or camera, sample
+photos, annotated output, per-stage latency, reviewer buttons, "Delete my data"), in the collector app after a
+retake, and on each review card. Details, evaluation and limits: [`vision/README.md`](vision/README.md),
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/TECHNICAL_REPORT.md`](docs/TECHNICAL_REPORT.md).
+
+Run it locally without AWS (same handler, S3 and DynamoDB in memory):
+
+```bash
+cd vision && python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
+WW_VISION_KEY=local .venv/Scripts/python local_server.py          # http://127.0.0.1:8100
+# then start the API with: WW_VISION_URL=http://127.0.0.1:8100 WW_VISION_KEY=local
+```
+
+Without `WW_VISION_URL` everything works as before: pickups are recorded as marked and `/vision` says it is off.
+
 ## Photo check
 
 The duplicate-photo hash catches a photo used twice. It cannot tell whether the photo shows what the collector
@@ -237,6 +264,8 @@ Nothing here has a permissive default: a missing secret always means "refuse", n
 | `WW_DEMO_MODE` | api + web | Lets the demo shortcuts exist, when the URL also says `?demo=1` | No shortcuts; real GPS and the real photo check |
 | `WW_ALLOW_RESET` | api + web | Allows `POST /api/demo/reset` at all | Reset answers 403 |
 | `WW_DEMO_KEY` | api + web | The `X-Demo-Key` that reset requires | Reset answers 403 |
+| `WW_VISION_URL` | api | The vision Lambda's function URL (printed by `vision/deploy.sh`) | No vision: pickups recorded as marked, `/vision` answers 503 |
+| `WW_VISION_KEY` | api | Shared secret sent as `X-WW-Key`; the Lambda refuses calls without it | Same as above |
 
 `WW_DEMO_MODE`, `WW_ALLOW_RESET` and `WW_DEMO_KEY` go to both services: the API decides what a request may do,
 and the web app decides what to put on screen. The two checks are independent on purpose.
@@ -247,6 +276,7 @@ and the web app decides what to put on screen. The two checks are independent on
 cd backend && .venv/Scripts/python -m pytest -q
 cd frontend && npm test          # voice composition, and that every prompt it can speak has a clip
 cd frontend && npm run lint && npx tsc --noEmit && npx next build
+cd vision && .venv/Scripts/python -m pytest -q   # pipeline, agent, Lambda handler (fake S3/DynamoDB)
 ```
 
 The backend tests pin the env they need themselves (`tests/conftest.py`), including leaving `GEMINI_API_KEY`
@@ -260,6 +290,8 @@ unset, so no test calls the network.
 | `test_concurrency.py` | Double accept, double approve, a replayed webhook, a repeated IVR keypress, and the conditional updates themselves |
 | `test_private_sale.py` | Picking a shop within 5 km; that another dealer gets 404 from every route for a sale that is not theirs; each queue holding only its own; the collector's status list through to paid; cancel; what Satin does and does not see |
 | `test_photo_reliability.py` | The photo check against a fake HTTP layer: a retried rate limit, two timeouts becoming "unchecked" with the reason on `/api/health`, the 512 px image, the configured model id, and that health never carries the key |
+| `test_doorstep.py` | Phase 2 doorstep flow, plus the review fixes: a second billing run cannot spend the credit twice, one household cannot freeze a collector, the streak passes 60, the compliance log is paid-only, a dealer upgrade bills once |
+| `test_vision_agent.py` | The pickup agent with a fake Lambda: retake (nothing recorded), points held until a person decides, reviewer agrees → flag, Lambda down → recorded and held, ops-only queue |
 | `test_review_fixes.py` | The setup lock is released, the photo check runs outside the lock and the transaction, and Satin staff are backfilled on an older database |
 
 The same tests run against Postgres when `DATABASE_URL` is set. Without installing Postgres, PGlite works:
@@ -274,7 +306,19 @@ connection at a time by default. PGlite also runs transactions one at a time, so
 only against a real Postgres — which is why the guarded updates have a direct test as well, and why the
 double-accept check is re-run on the preview deploy.
 
-## Deploy (Vercel only)
+## Deploy the vision service (AWS)
+
+```bash
+cd vision
+WW_VISION_KEY=$(openssl rand -hex 32) ./deploy.sh     # keep the key: the API needs the same one
+```
+
+Creates (or updates) in `ap-south-1`: S3 bucket `worthywaste-vision-<account>` (private, 30-day expiry), DynamoDB
+table `ww-vision-runs` (on-demand, TTL), IAM role `ww-vision-lambda` (only that bucket prefix and table), Lambda
+`ww-vision` (Python 3.12, 2 GB, function URL guarded by the key) and the CloudWatch dashboard `WorthyWaste-Vision`.
+It prints `WW_VISION_URL`; set it and `WW_VISION_KEY` on the API (Vercel env vars below).
+
+## Deploy (Vercel)
 
 One Vercel project runs both halves with [Vercel Services](https://vercel.com/docs/services) (beta, all plans).
 The root `vercel.json` defines a `web` service (Next.js, `frontend/`) and an `api` service (FastAPI, `backend/`),
@@ -296,6 +340,8 @@ and routes `/api/*` to the API and everything else to the web app, on one domain
    | `WW_DEMO_MODE` | `1` for the recording, unset otherwise | Lets the demo shortcuts exist on URLs that ask with `?demo=1` |
    | `GEMINI_API_KEY` | from Google AI Studio | Turns on the photo check. Without it photos come back `unchecked` and nothing breaks. |
    | `GEMINI_MODEL` | optional, e.g. `gemini-3.5-flash` | Overrides the default `gemini-3.5-flash-lite` |
+   | `WW_VISION_URL` | printed by `vision/deploy.sh` | Turns on the segregation check and `/vision` |
+   | `WW_VISION_KEY` | the key you deployed the Lambda with | Sent as `X-WW-Key`; the Lambda refuses calls without it |
 
    `WW_SECRET`, `WW_DEMO_MODE`, `WW_ALLOW_RESET` and `WW_DEMO_KEY` are read by **both** services, so add them
    without restricting them to one. `GEMINI_*` and `WW_PROVIDER_SECRET` are only read by the API.

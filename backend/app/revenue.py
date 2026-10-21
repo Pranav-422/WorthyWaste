@@ -79,8 +79,10 @@ def dealer_upgrade(conn, dealer_id: int) -> dict:
     if d["plan"] == "pro":
         return dealer_plan(conn, dealer_id)
     now = clock.ts()
-    conn.execute("UPDATE dealers SET plan = 'pro', plan_since = ? WHERE id = ? AND plan = 'free'", (now, dealer_id))
-    record(conn, "dealer_pro", DEALER_PRO_MONTHLY_FEE, ref_type="dealer", ref_id=dealer_id, note="First month")
+    cur = conn.execute("UPDATE dealers SET plan = 'pro', plan_since = ? WHERE id = ? AND plan = 'free'",
+                       (now, dealer_id))
+    if cur.rowcount == 1:  # a second tap on another instance changes nothing and must not bill again
+        record(conn, "dealer_pro", DEALER_PRO_MONTHLY_FEE, ref_type="dealer", ref_id=dealer_id, note="First month")
     return dealer_plan(conn, dealer_id)
 
 

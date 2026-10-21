@@ -409,8 +409,66 @@ class SkippedKyc(KycAdapter):
         return True
 
 
+# ---------- Vision (the OpenCV pipeline and the pickup agent, on AWS Lambda: vision/) ----------
+
+class VisionError(Exception):
+    pass
+
+
+class VisionClient:
+    """The vision Lambda's function URL. Every call carries the shared X-WW-Key. Unset WW_VISION_URL
+    means no vision: pickups are recorded as the collector marked them, as before Phase 3."""
+
+    def __init__(self, url: str, key: str):
+        self.url, self.key = url.rstrip("/"), key
+        self.last_error: dict | None = None
+        self.last_ms: float | None = None
+
+    def call(self, method: str, path: str, body: dict | None = None, timeout: float = 40) -> dict:
+        import json
+        import time
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(self.url + path, method=method, headers={
+            "x-ww-key": self.key, "content-type": "application/json"},
+            data=json.dumps(body).encode() if body is not None else None)
+        t = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                out = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read()[:200].decode(errors="replace")
+            if e.code in (404, 409):  # the caller's problem, not an outage
+                raise VisionError(f"{e.code}: {detail}") from e
+            self._fail(f"HTTP {e.code}: {detail}")
+            raise VisionError(f"HTTP {e.code}") from e
+        except Exception as e:  # timeout, DNS, bad JSON: the agent falls back
+            self._fail(f"{type(e).__name__}: {e}")
+            raise VisionError(str(e)) from e
+        self.last_ms = round((time.perf_counter() - t) * 1000)
+        return out
+
+    def _fail(self, why: str) -> None:
+        from .clock import ts
+        self.last_error = {"at": ts(), "reason": why[:200]}
+
+    def analyze(self, jpeg: bytes, *, marked: str | None, attempt: int, source: str, ref: dict | None = None,
+                return_safe: bool = False) -> dict:
+        import base64
+        return self.call("POST", "/analyze", {"image_b64": base64.b64encode(jpeg).decode(), "marked": marked,
+                                              "attempt": attempt, "source": source, "ref": ref or {},
+                                              "return_safe": return_safe})
+
+
+def build_vision() -> VisionClient | None:
+    url, key = os.environ.get("WW_VISION_URL"), os.environ.get("WW_VISION_KEY")
+    return VisionClient(url, key) if url and key else None
+
+
 scale: ScaleAdapter = SimulatedScale()
 payments: PaymentAdapter = MockUpi()
 messages: MessageAdapter = OnScreenMessages()
 kyc: KycAdapter = SkippedKyc()
 photo_verifier: PhotoVerifier = build_photo_verifier()
+vision: VisionClient | None = build_vision()
